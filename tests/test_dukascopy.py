@@ -512,8 +512,43 @@ class DukascopyCandleTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 1)
             self.assertIn("[2026-09-12] Downloaded; no candles (empty date)", stdout.getvalue())
+            self.assertIn("Empty days: 2026-09-12", stdout.getvalue())
+            self.assertIn("Failed days: 2026-09-13", stdout.getvalue())
+            self.assertIn("Skipped days: none", stdout.getvalue())
             self.assertIn("Summary: processed=3 successful=1 empty=1 failed=1", stdout.getvalue())
             self.assertIn("[2026-09-13] ERROR: simulated network failure", stderr.getvalue())
+            self.assertNotIn("Raw JSON:", stdout.getvalue())
+            self.assertNotIn("Parquet:", stdout.getvalue())
+
+    def test_main_reports_skipped_days_without_filesystem_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            arguments = [
+                "download",
+                "--instrument",
+                "EUR-USD",
+                "--side",
+                "BID",
+                "--date",
+                "2026-09-13",
+                "--aggregation",
+                "15",
+            ]
+            main(arguments, output_root=output_root, fetcher=lambda _: sample_bytes())
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    arguments,
+                    output_root=output_root,
+                    fetcher=lambda _: self.fail("cached JSON should be reused"),
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("Skipped days: 2026-09-13", stdout.getvalue())
+            self.assertIn("Summary: processed=1 successful=0 empty=0 failed=0 skipped=1", stdout.getvalue())
+            self.assertNotIn("Raw JSON:", stdout.getvalue())
+            self.assertNotIn("Parquet:", stdout.getvalue())
 
     def test_batch_aggregations_create_missing_and_skip_existing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

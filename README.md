@@ -104,7 +104,7 @@ Use `--help` for the complete command syntax:
 uv run dukascopy download --help
 ```
 
-Dates in a range are processed sequentially and independently. Each date has its own raw JSON cache and Parquet outputs. A failure for one date is reported while later dates continue processing; the final exit status is `1` if any date failed and `0` if every date succeeded or was a valid empty day.
+Dates in a range are processed sequentially and independently. Each date has its own raw JSON cache and Parquet outputs. A failure for one date is reported while later dates continue processing; the final exit status is `1` if any date failed and `0` if every date succeeded or was a valid empty day. Download logging reports created and skipped aggregations without printing local filesystem paths. Before the final summary it lists the empty, failed, and fully skipped dates.
 
 ## Decoding and aggregation
 

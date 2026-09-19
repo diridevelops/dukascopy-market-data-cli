@@ -96,7 +96,6 @@ def _print_download_results(outcomes) -> int:
         source_message = "Downloaded" if result.raw_was_downloaded else "Reused cached JSON"
         if result.minute_count == 0:
             print(f"[{date_label}] {source_message}; no candles (empty date)")
-            print(f"[{date_label}] Raw JSON: {result.json_path}")
             continue
 
         print(f"[{date_label}] {source_message} and decoded {result.minute_count} minute candles")
@@ -106,21 +105,26 @@ def _print_download_results(outcomes) -> int:
         if result.skipped_aggregations:
             skipped = ", ".join(f"{aggregation}m" for aggregation in result.skipped_aggregations)
             print(f"[{date_label}] Skipped existing aggregations: {skipped}")
-        print(f"[{date_label}] Raw JSON: {result.json_path}")
-        for parquet_path in result.parquet_paths:
-            print(f"[{date_label}] Parquet: {parquet_path}")
 
     failed_count = sum(outcome.error is not None for outcome in outcomes)
-    empty_count = sum(
-        outcome.result is not None and outcome.result.minute_count == 0 for outcome in outcomes
-    )
-    skipped_date_count = sum(
-        outcome.result is not None
+    empty_dates = [
+        outcome.requested_date.isoformat()
+        for outcome in outcomes
+        if outcome.result is not None and outcome.result.minute_count == 0
+    ]
+    failed_dates = [
+        outcome.requested_date.isoformat() for outcome in outcomes if outcome.error is not None
+    ]
+    skipped_dates = [
+        outcome.requested_date.isoformat()
+        for outcome in outcomes
+        if outcome.result is not None
         and outcome.result.minute_count > 0
         and not outcome.result.created_aggregations
         and bool(outcome.result.skipped_aggregations)
-        for outcome in outcomes
-    )
+    ]
+    empty_count = len(empty_dates)
+    skipped_date_count = len(skipped_dates)
     successful_count = len(outcomes) - failed_count - empty_count - skipped_date_count
     created_count = sum(
         len(outcome.result.created_aggregations)
@@ -132,6 +136,9 @@ def _print_download_results(outcomes) -> int:
         for outcome in outcomes
         if outcome.result is not None
     )
+    print(f"Empty days: {', '.join(empty_dates) if empty_dates else 'none'}")
+    print(f"Failed days: {', '.join(failed_dates) if failed_dates else 'none'}")
+    print(f"Skipped days: {', '.join(skipped_dates) if skipped_dates else 'none'}")
     print(
         "Summary: "
         f"processed={len(outcomes)} "
