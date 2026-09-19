@@ -21,11 +21,13 @@ from dukascopy_market_data.candles import (
     parquet_output_paths,
     raw_json_path,
     run_download,
+    run_combined_downloads,
     run_date_range,
     run_downloads,
     resolve_requested_dates,
     validate_aggregation,
     validate_aggregations,
+    validate_download_side,
     validate_instrument,
     validate_side,
     write_parquet,
@@ -58,6 +60,28 @@ def sample_payload(timestamp: int = BASE_TIMESTAMP) -> dict:
 
 def sample_bytes(timestamp: int = BASE_TIMESTAMP) -> bytes:
     return json.dumps(sample_payload(timestamp), separators=(",", ":")).encode("utf-8")
+
+
+def ask_payload(timestamp: int = BASE_TIMESTAMP) -> dict:
+    return {
+        "timestamp": timestamp,
+        "multiplier": 0.01,
+        "open": 1.10,
+        "high": 1.12,
+        "low": 1.09,
+        "close": 1.11,
+        "shift": 60_000,
+        "times": [0, 1, 2, 12, 1],
+        "opens": [0, -1, 2, 1, -2],
+        "highs": [0, 1, -1, 2, 0],
+        "lows": [0, -1, 1, -2, 1],
+        "closes": [0, 2, -1, 2, -2],
+        "volumes": [2.0, 1.0, 1.5, 0.5, 0.75],
+    }
+
+
+def ask_bytes(timestamp: int = BASE_TIMESTAMP) -> bytes:
+    return json.dumps(ask_payload(timestamp), separators=(",", ":")).encode("utf-8")
 
 
 def empty_payload(timestamp: int = BASE_TIMESTAMP) -> dict:
@@ -93,6 +117,7 @@ class DukascopyCandleTests(unittest.TestCase):
         self.assertEqual(validate_instrument("0005.HK-HKD"), "0005.HK-HKD")
         self.assertEqual(validate_instrument("DUKplus-EUR"), "DUKplus-EUR")
         self.assertEqual(validate_side("bid"), "BID")
+        self.assertEqual(validate_download_side("comb"), "COMB")
         self.assertEqual(validate_aggregation("15"), 15)
         self.assertEqual(validate_aggregations("1, 5, 15, 5"), (1, 5, 15))
         self.assertEqual(
@@ -110,6 +135,8 @@ class DukascopyCandleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_side("MID")
         with self.assertRaises(ValueError):
+            validate_download_side("MID")
+        with self.assertRaises(ValueError):
             validate_aggregation(0)
         with self.assertRaises(ValueError):
             validate_aggregations("1,,5")
@@ -117,6 +144,34 @@ class DukascopyCandleTests(unittest.TestCase):
             expand_date_range(date(2026, 9, 3), date(2026, 9, 1))
         with self.assertRaises(ValueError):
             resolve_requested_dates(REQUESTED_DATE, date(2026, 9, 1), date(2026, 9, 3))
+
+        parser = build_argument_parser()
+        default_combined = parser.parse_args(
+            [
+                "download",
+                "--instrument",
+                "EUR-USD",
+                "--date",
+                "2026-09-13",
+                "--aggregation",
+                "15",
+            ]
+        )
+        self.assertEqual(default_combined.side, "COMB")
+        explicit_combined = parser.parse_args(
+            [
+                "download",
+                "--instrument",
+                "EUR-USD",
+                "--side",
+                "COMB",
+                "--date",
+                "2026-09-13",
+                "--aggregation",
+                "15",
+            ]
+        )
+        self.assertEqual(explicit_combined.side, "COMB")
         with self.assertRaises(ValueError):
             resolve_requested_dates(None, date(2026, 9, 1), None)
 
@@ -169,6 +224,10 @@ class DukascopyCandleTests(unittest.TestCase):
         self.assertEqual(
             build_endpoint_url("DUKplus-EUR", "BID", REQUESTED_DATE),
             "https://jetta.dukascopy.com/v1/candles/minute/DUKplus-EUR/BID/2026/9/13",
+        )
+        self.assertEqual(
+            raw_json_path(Path("output"), "EUR-USD", REQUESTED_DATE, "BID").as_posix(),
+            "output/candles/minute/json/EUR-USD-2026-09-13-BID.json",
         )
 
     def test_instrument_codes_are_sorted_deduplicated_and_exact(self) -> None:
@@ -337,6 +396,254 @@ class DukascopyCandleTests(unittest.TestCase):
             dataset = ds.dataset(output_root / "candles" / "15m", format="parquet", partitioning="hive")
             self.assertEqual(dataset.to_table().num_rows, 2)
             self.assertEqual(set(dataset.schema.names), {"timestamp", "open", "high", "low", "close", "volume", "year", "month", "day"})
+
+    def test_combined_download_fetches_both_sides_and_writes_combined_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            calls: list[str] = []
+
+            def fetch(url: str) -> bytes:
+                calls.append(url)
+                self.assertNotIn("/COMB/", url)
+                if "/BID/" in url:
+                    return sample_bytes()
+                if "/ASK/" in url:
+                    return ask_bytes()
+                self.fail(f"unexpected URL: {url}")
+
+            first = run_combined_downloads(
+                "EUR-USD",
+                REQUESTED_DATE,
+                15,
+                output_root=output_root,
+                fetcher=fetch,
+            )
+
+            self.assertEqual(
+                calls,
+                [
+                    "https://jetta.dukascopy.com/v1/candles/minute/EUR-USD/BID/2026/9/13",
+                    "https://jetta.dukascopy.com/v1/candles/minute/EUR-USD/ASK/2026/9/13",
+                ],
+            )
+            self.assertEqual(first.minute_count, 5)
+            self.assertEqual(first.raw_downloaded_sides, ("BID", "ASK"))
+            self.assertEqual(first.raw_cached_sides, ())
+            self.assertEqual(first.created_aggregations, (15,))
+            self.assertEqual(len(first.parquet_paths), 1)
+            output_path = first.parquet_paths[0]
+            self.assertEqual(output_path.name, "EUR-USD-2026-09-13-COMB.parquet")
+
+            table = pq.read_table(output_path)
+            self.assertEqual(
+                [field.name for field in table.schema],
+                [
+                    "timestamp",
+                    "bidOpen",
+                    "bidHigh",
+                    "bidLow",
+                    "bidClose",
+                    "askOpen",
+                    "askHigh",
+                    "askLow",
+                    "askClose",
+                    "bidVolume",
+                    "askVolume",
+                ],
+            )
+            self.assertEqual(str(table.schema.field("timestamp").type), "timestamp[ms, tz=UTC]")
+            for field_name in (
+                "bidOpen",
+                "bidHigh",
+                "bidLow",
+                "bidClose",
+                "askOpen",
+                "askHigh",
+                "askLow",
+                "askClose",
+            ):
+                self.assertEqual(str(table.schema.field(field_name).type), "double")
+            self.assertEqual(str(table.schema.field("bidVolume").type), "int64")
+            self.assertEqual(str(table.schema.field("askVolume").type), "int64")
+            self.assertEqual(table.column("bidOpen")[0].as_py(), 1.0)
+            self.assertEqual(table.column("askOpen")[0].as_py(), 1.1)
+            self.assertEqual(table.column("bidVolume")[0].as_py(), 3_250_000)
+            self.assertEqual(table.column("askVolume")[0].as_py(), 4_500_000)
+
+            bid_raw_before = raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "BID").read_bytes()
+            ask_raw_before = raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "ASK").read_bytes()
+
+            def fail_on_cached_download(_: str) -> bytes:
+                self.fail("combined cached JSON must be reused")
+
+            second = run_combined_downloads(
+                "EUR-USD",
+                REQUESTED_DATE,
+                5,
+                output_root=output_root,
+                fetcher=fail_on_cached_download,
+            )
+            self.assertEqual(second.raw_downloaded_sides, ())
+            self.assertEqual(second.raw_cached_sides, ("BID", "ASK"))
+            self.assertEqual(second.created_aggregations, (5,))
+            self.assertEqual(
+                raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "BID").read_bytes(),
+                bid_raw_before,
+            )
+            self.assertEqual(
+                raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "ASK").read_bytes(),
+                ask_raw_before,
+            )
+
+            third = run_combined_downloads(
+                "EUR-USD",
+                REQUESTED_DATE,
+                15,
+                output_root=output_root,
+                fetcher=fail_on_cached_download,
+            )
+            self.assertEqual(third.created_aggregations, ())
+            self.assertEqual(third.skipped_aggregations, (15,))
+            self.assertEqual(third.parquet_paths, ())
+
+    def test_main_defaults_to_combined_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            calls: list[str] = []
+
+            def fetch(url: str) -> bytes:
+                calls.append(url)
+                return ask_bytes() if "/ASK/" in url else sample_bytes()
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "download",
+                        "--instrument",
+                        "EUR-USD",
+                        "--date",
+                        "2026-09-13",
+                        "--aggregation",
+                        "15",
+                    ],
+                    output_root=output_root,
+                    fetcher=fetch,
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(
+                (
+                    output_root
+                    / "candles"
+                    / "15m"
+                    / "year=2026"
+                    / "month=09"
+                    / "day=13"
+                    / "EUR-USD-2026-09-13-COMB.parquet"
+                ).exists()
+            )
+
+    def test_combined_download_rejects_count_and_timestamp_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            mismatched = ask_payload()
+            for field in ("times", "opens", "highs", "lows", "closes", "volumes"):
+                mismatched[field] = mismatched[field][:-1]
+
+            def fetch_mismatched_count(url: str) -> bytes:
+                return sample_bytes() if "/BID/" in url else json.dumps(mismatched).encode("utf-8")
+
+            with self.assertRaises(DataValidationError):
+                run_combined_downloads(
+                    "EUR-USD",
+                    REQUESTED_DATE,
+                    15,
+                    output_root=output_root,
+                    fetcher=fetch_mismatched_count,
+                )
+            self.assertFalse(raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "BID").exists())
+            self.assertFalse(raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "ASK").exists())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+
+            def fetch_mismatched_timestamp(url: str) -> bytes:
+                return sample_bytes() if "/BID/" in url else ask_bytes(BASE_TIMESTAMP + 60_000)
+
+            with self.assertRaises(DataValidationError):
+                run_combined_downloads(
+                    "EUR-USD",
+                    REQUESTED_DATE,
+                    15,
+                    output_root=output_root,
+                    fetcher=fetch_mismatched_timestamp,
+                )
+
+    def test_combined_empty_day_caches_both_sides_and_requires_both_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            result = run_combined_downloads(
+                "EUR-USD",
+                REQUESTED_DATE,
+                "1,5,15",
+                output_root=output_root,
+                fetcher=lambda _: empty_bytes(),
+            )
+            self.assertEqual(result.minute_count, 0)
+            self.assertEqual(result.parquet_paths, ())
+            self.assertTrue(raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "BID").exists())
+            self.assertTrue(raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "ASK").exists())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+
+            def fetch_one_empty(url: str) -> bytes:
+                return empty_bytes() if "/BID/" in url else ask_bytes()
+
+            with self.assertRaises(DataValidationError):
+                run_combined_downloads(
+                    "EUR-USD",
+                    REQUESTED_DATE,
+                    15,
+                    output_root=output_root,
+                    fetcher=fetch_one_empty,
+                )
+
+    def test_combined_date_range_keeps_daily_outputs_and_partitions(self) -> None:
+        first_date = date(2026, 9, 13)
+        second_date = date(2026, 9, 14)
+
+        def fetch_by_date(url: str) -> bytes:
+            timestamp = timestamp_for_day(second_date) if url.endswith("/2026/9/14") else timestamp_for_day(first_date)
+            return ask_bytes(timestamp) if "/ASK/" in url else sample_bytes(timestamp)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            outcomes = run_date_range(
+                "EUR-USD",
+                "COMB",
+                (first_date, second_date),
+                15,
+                output_root=output_root,
+                fetcher=fetch_by_date,
+            )
+
+            self.assertTrue(all(outcome.error is None for outcome in outcomes))
+            for requested_date in (first_date, second_date):
+                parquet_path = (
+                    output_root
+                    / "candles"
+                    / "15m"
+                    / "year=2026"
+                    / "month=09"
+                    / f"day={requested_date.day:02d}"
+                    / f"EUR-USD-{requested_date.isoformat()}-COMB.parquet"
+                )
+                self.assertTrue(parquet_path.exists())
+                self.assertTrue(raw_json_path(output_root, "EUR-USD", requested_date, "BID").exists())
+                self.assertTrue(raw_json_path(output_root, "EUR-USD", requested_date, "ASK").exists())
 
     def test_existing_raw_json_is_reused_for_new_aggregation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

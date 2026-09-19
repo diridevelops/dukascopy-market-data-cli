@@ -14,8 +14,8 @@ from .candles import (
     resolve_requested_dates,
     run_date_range,
     validate_aggregations,
+    validate_download_side,
     validate_instrument,
-    validate_side,
 )
 from .instruments import fetch_instrument_codes
 
@@ -36,7 +36,7 @@ def _instrument_argument(value: str) -> str:
 
 def _side_argument(value: str) -> str:
     try:
-        return validate_side(value)
+        return validate_download_side(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
@@ -50,7 +50,12 @@ def _aggregations_argument(value: str) -> tuple[int, ...]:
 
 def _add_download_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--instrument", required=True, type=_instrument_argument)
-    parser.add_argument("--side", required=True, type=_side_argument)
+    parser.add_argument(
+        "--side",
+        default="COMB",
+        type=_side_argument,
+        help="output mode: BID, ASK, or COMB (default: COMB)",
+    )
     date_group = parser.add_mutually_exclusive_group()
     date_group.add_argument("--date", type=_date_argument, dest="requested_date")
     date_group.add_argument("--start-date", type=_date_argument)
@@ -93,7 +98,7 @@ def _print_download_results(outcomes) -> int:
 
         result = outcome.result
         assert result is not None
-        source_message = "Downloaded" if result.raw_was_downloaded else "Reused cached JSON"
+        source_message = result.source_message
         if result.minute_count == 0:
             print(f"[{date_label}] {source_message}; no candles (empty date)")
             continue

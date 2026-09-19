@@ -73,6 +73,23 @@ class AggregatedCandle:
 
 
 @dataclass(frozen=True)
+class CombinedAggregatedCandle:
+    """One aggregated candle containing aligned BID and ASK values."""
+
+    timestamp_ms: int
+    bid_open: Decimal
+    bid_high: Decimal
+    bid_low: Decimal
+    bid_close: Decimal
+    ask_open: Decimal
+    ask_high: Decimal
+    ask_low: Decimal
+    ask_close: Decimal
+    bid_volume: int
+    ask_volume: int
+
+
+@dataclass(frozen=True)
 class DownloadBatchResult:
     """Result of processing one or more requested aggregations."""
 
@@ -83,13 +100,47 @@ class DownloadBatchResult:
     created_aggregations: tuple[int, ...]
     skipped_aggregations: tuple[int, ...]
 
+    @property
+    def source_message(self) -> str:
+        return "Downloaded" if self.raw_was_downloaded else "Reused cached JSON"
+
+
+@dataclass(frozen=True)
+class CombinedDownloadBatchResult:
+    """Result of processing aligned BID and ASK data."""
+
+    json_paths: tuple[Path, Path]
+    parquet_paths: tuple[Path, ...]
+    minute_count: int
+    raw_downloaded_sides: tuple[str, ...]
+    raw_cached_sides: tuple[str, ...]
+    created_aggregations: tuple[int, ...]
+    skipped_aggregations: tuple[int, ...]
+
+    @property
+    def raw_was_downloaded(self) -> bool:
+        return bool(self.raw_downloaded_sides)
+
+    @property
+    def source_message(self) -> str:
+        downloaded = self.raw_downloaded_sides
+        cached = self.raw_cached_sides
+        if downloaded and cached:
+            return (
+                f"Downloaded {', '.join(downloaded)} JSON and reused cached "
+                f"{', '.join(cached)} JSON"
+            )
+        if downloaded:
+            return f"Downloaded {' and '.join(downloaded)} JSON"
+        return f"Reused cached {' and '.join(cached)} JSON"
+
 
 @dataclass(frozen=True)
 class DateRunOutcome:
     """Outcome for one requested endpoint date."""
 
     requested_date: date
-    result: DownloadBatchResult | None
+    result: DownloadBatchResult | CombinedDownloadBatchResult | None
     error: str | None
 
 
@@ -113,6 +164,15 @@ def validate_side(value: str) -> str:
     side = value.strip().upper()
     if side not in {"BID", "ASK"}:
         raise ValueError(f"side must be BID or ASK; received {value!r}")
+    return side
+
+
+def validate_download_side(value: str) -> str:
+    """Normalize a requested output mode, including the combined mode."""
+
+    side = value.strip().upper()
+    if side not in {"BID", "ASK", "COMB"}:
+        raise ValueError(f"side must be BID, ASK, or COMB; received {value!r}")
     return side
 
 
@@ -430,6 +490,66 @@ def aggregate_candles(
     return [grouped[timestamp] for timestamp in sorted(grouped)]
 
 
+def combine_candles(
+    bid_candles: Sequence[MinuteCandle], ask_candles: Sequence[MinuteCandle]
+) -> list[tuple[MinuteCandle, MinuteCandle]]:
+    """Pair BID and ASK candles only when their decoded timelines match."""
+
+    if len(bid_candles) != len(ask_candles):
+        raise DataValidationError(
+            "BID and ASK candle counts must match; "
+            f"BID has {len(bid_candles)}, ASK has {len(ask_candles)}"
+        )
+    for index, (bid_candle, ask_candle) in enumerate(zip(bid_candles, ask_candles)):
+        if bid_candle.timestamp_ms != ask_candle.timestamp_ms:
+            raise DataValidationError(
+                "BID and ASK timestamps must match at each position; "
+                f"index {index} has {bid_candle.timestamp_ms} and {ask_candle.timestamp_ms}"
+            )
+    return list(zip(bid_candles, ask_candles))
+
+
+def aggregate_combined_candles(
+    bid_candles: Sequence[MinuteCandle],
+    ask_candles: Sequence[MinuteCandle],
+    aggregation_minutes: int | str,
+) -> list[CombinedAggregatedCandle]:
+    """Aggregate aligned BID and ASK candles into combined rows."""
+
+    paired = combine_candles(bid_candles, ask_candles)
+    if not paired:
+        return []
+
+    bid_aggregated = aggregate_candles(bid_candles, aggregation_minutes)
+    ask_aggregated = aggregate_candles(ask_candles, aggregation_minutes)
+    if len(bid_aggregated) != len(ask_aggregated):
+        raise DataValidationError("BID and ASK aggregation bucket counts must match")
+
+    combined: list[CombinedAggregatedCandle] = []
+    for index, (bid_candle, ask_candle) in enumerate(zip(bid_aggregated, ask_aggregated)):
+        if bid_candle.timestamp_ms != ask_candle.timestamp_ms:
+            raise DataValidationError(
+                "BID and ASK aggregation buckets must match; "
+                f"index {index} has {bid_candle.timestamp_ms} and {ask_candle.timestamp_ms}"
+            )
+        combined.append(
+            CombinedAggregatedCandle(
+                timestamp_ms=bid_candle.timestamp_ms,
+                bid_open=bid_candle.open,
+                bid_high=bid_candle.high,
+                bid_low=bid_candle.low,
+                bid_close=bid_candle.close,
+                ask_open=ask_candle.open,
+                ask_high=ask_candle.high,
+                ask_low=ask_candle.low,
+                ask_close=ask_candle.close,
+                bid_volume=bid_candle.volume,
+                ask_volume=ask_candle.volume,
+            )
+        )
+    return combined
+
+
 def raw_json_path(output_root: Path, instrument: str, requested_date: date, side: str) -> Path:
     """Return the deterministic raw JSON destination."""
 
@@ -437,7 +557,7 @@ def raw_json_path(output_root: Path, instrument: str, requested_date: date, side
         output_root
         / "candles"
         / "minute"
-        / "jsons"
+        / "json"
         / f"{instrument}-{requested_date.isoformat()}-{side}.json"
     )
 
@@ -458,6 +578,31 @@ def parquet_output_paths(
 
     partitions: dict[Path, list[AggregatedCandle]] = defaultdict(list)
     filename = f"{instrument}-{requested_date.isoformat()}-{side}.parquet"
+    for candle in candles:
+        partition_date = _partition_date(candle.timestamp_ms)
+        partition_dir = (
+            output_root
+            / "candles"
+            / f"{aggregation_minutes}m"
+            / f"year={partition_date.year:04d}"
+            / f"month={partition_date.month:02d}"
+            / f"day={partition_date.day:02d}"
+        )
+        partitions[partition_dir / filename].append(candle)
+    return dict(sorted(partitions.items(), key=lambda item: str(item[0])))
+
+
+def combined_parquet_output_paths(
+    candles: Sequence[CombinedAggregatedCandle],
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    aggregation_minutes: int,
+) -> dict[Path, list[CombinedAggregatedCandle]]:
+    """Return combined output paths grouped by their UTC Hive partition."""
+
+    partitions: dict[Path, list[CombinedAggregatedCandle]] = defaultdict(list)
+    filename = f"{instrument}-{requested_date.isoformat()}-COMB.parquet"
     for candle in candles:
         partition_date = _partition_date(candle.timestamp_ms)
         partition_dir = (
@@ -502,6 +647,41 @@ def _table_for_candles(
         b"requested_date": requested_date.isoformat().encode("ascii"),
         b"aggregation_minutes": str(aggregation_minutes).encode("ascii"),
         b"source_url": build_endpoint_url(instrument, side, requested_date).encode("utf-8"),
+    }
+    return table.replace_schema_metadata(metadata)
+
+
+def _table_for_combined_candles(
+    candles: Sequence[CombinedAggregatedCandle],
+    instrument: str,
+    requested_date: date,
+    aggregation_minutes: int,
+) -> pa.Table:
+    table = pa.table(
+        {
+            "timestamp": pa.array(
+                [candle.timestamp_ms for candle in candles],
+                type=pa.timestamp("ms", tz="UTC"),
+            ),
+            "bidOpen": pa.array([float(candle.bid_open) for candle in candles], type=pa.float64()),
+            "bidHigh": pa.array([float(candle.bid_high) for candle in candles], type=pa.float64()),
+            "bidLow": pa.array([float(candle.bid_low) for candle in candles], type=pa.float64()),
+            "bidClose": pa.array([float(candle.bid_close) for candle in candles], type=pa.float64()),
+            "askOpen": pa.array([float(candle.ask_open) for candle in candles], type=pa.float64()),
+            "askHigh": pa.array([float(candle.ask_high) for candle in candles], type=pa.float64()),
+            "askLow": pa.array([float(candle.ask_low) for candle in candles], type=pa.float64()),
+            "askClose": pa.array([float(candle.ask_close) for candle in candles], type=pa.float64()),
+            "bidVolume": pa.array([candle.bid_volume for candle in candles], type=pa.int64()),
+            "askVolume": pa.array([candle.ask_volume for candle in candles], type=pa.int64()),
+        }
+    )
+    metadata = {
+        b"instrument": instrument.encode("utf-8"),
+        b"side": b"COMB",
+        b"requested_date": requested_date.isoformat().encode("ascii"),
+        b"aggregation_minutes": str(aggregation_minutes).encode("ascii"),
+        b"bid_source_url": build_endpoint_url(instrument, "BID", requested_date).encode("utf-8"),
+        b"ask_source_url": build_endpoint_url(instrument, "ASK", requested_date).encode("utf-8"),
     }
     return table.replace_schema_metadata(metadata)
 
@@ -551,6 +731,67 @@ def write_parquet(
                 partition_candles,
                 normalized_instrument,
                 normalized_side,
+                requested_date,
+                normalized_aggregation,
+            )
+            pq.write_table(table, temporary_path, compression="zstd")
+
+        for temporary_path, final_path in zip(temporary_paths, final_paths):
+            if final_path.exists():
+                raise FileExistsError(f"refusing to overwrite existing Parquet file: {final_path}")
+            os.replace(temporary_path, final_path)
+            published_paths.append(final_path)
+        temporary_paths.clear()
+        return final_paths
+    except Exception:
+        for temporary_path in temporary_paths:
+            temporary_path.unlink(missing_ok=True)
+        for published_path in published_paths:
+            published_path.unlink(missing_ok=True)
+        raise
+
+
+def write_combined_parquet(
+    candles: Sequence[CombinedAggregatedCandle],
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    aggregation_minutes: int | str,
+) -> list[Path]:
+    """Write combined BID/ASK candles into non-overwriting Parquet files."""
+
+    if not candles:
+        raise ValueError("cannot write an empty candle sequence")
+    normalized_instrument = validate_instrument(instrument)
+    normalized_aggregation = validate_aggregation(aggregation_minutes)
+    paths_to_rows = combined_parquet_output_paths(
+        candles,
+        Path(output_root),
+        normalized_instrument,
+        requested_date,
+        normalized_aggregation,
+    )
+    final_paths = list(paths_to_rows)
+    existing = next((path for path in final_paths if path.exists()), None)
+    if existing is not None:
+        raise FileExistsError(f"refusing to overwrite existing Parquet file: {existing}")
+
+    published_paths: list[Path] = []
+    temporary_paths: list[Path] = []
+    try:
+        for final_path, partition_candles in paths_to_rows.items():
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary_name = tempfile.mkstemp(
+                prefix=".parquet-",
+                suffix=".tmp",
+                dir=final_path.parent,
+            )
+            os.close(fd)
+            temporary_path = Path(temporary_name)
+            temporary_paths.append(temporary_path)
+            table = _table_for_combined_candles(
+                partition_candles,
+                normalized_instrument,
                 requested_date,
                 normalized_aggregation,
             )
@@ -631,6 +872,35 @@ def download_json_bytes(
     raise DownloadError(f"could not download {url}: {last_error}") from last_error
 
 
+def _load_or_download_raw(
+    instrument: str,
+    side: str,
+    requested_date: date,
+    *,
+    output_root: Path,
+    fetcher: Callable[[str], bytes],
+) -> tuple[bytes, Path, bool]:
+    """Load one validated-cache candidate or download its raw response."""
+
+    normalized_instrument = validate_instrument(instrument)
+    normalized_side = validate_side(side)
+    normalized_root = Path(output_root)
+    destination = raw_json_path(
+        normalized_root,
+        normalized_instrument,
+        requested_date,
+        normalized_side,
+    )
+    was_downloaded = not destination.exists()
+    if was_downloaded:
+        return (
+            fetcher(build_endpoint_url(normalized_instrument, normalized_side, requested_date)),
+            destination,
+            True,
+        )
+    return destination.read_bytes(), destination, False
+
+
 def run_downloads(
     instrument: str,
     side: str,
@@ -639,22 +909,29 @@ def run_downloads(
     *,
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
-) -> DownloadBatchResult:
+) -> DownloadBatchResult | CombinedDownloadBatchResult:
     """Reuse or download raw data, then publish requested aggregations."""
 
     normalized_instrument = validate_instrument(instrument)
-    normalized_side = validate_side(side)
+    normalized_side = validate_download_side(side)
     normalized_aggregations = validate_aggregations(aggregation_minutes)
     normalized_root = Path(output_root)
-    url = build_endpoint_url(normalized_instrument, normalized_side, requested_date)
-    json_destination = raw_json_path(
-        normalized_root,
+    if normalized_side == "COMB":
+        return run_combined_downloads(
+            normalized_instrument,
+            requested_date,
+            normalized_aggregations,
+            output_root=normalized_root,
+            fetcher=fetcher,
+        )
+
+    raw_bytes, json_destination, raw_was_downloaded = _load_or_download_raw(
         normalized_instrument,
-        requested_date,
         normalized_side,
+        requested_date,
+        output_root=normalized_root,
+        fetcher=fetcher,
     )
-    raw_was_downloaded = not json_destination.exists()
-    raw_bytes = fetcher(url) if raw_was_downloaded else json_destination.read_bytes()
     minute_candles = decode_json_bytes(raw_bytes)
 
     if not minute_candles:
@@ -714,6 +991,122 @@ def run_downloads(
     )
 
 
+def run_combined_downloads(
+    instrument: str,
+    requested_date: date,
+    aggregation_minutes: int | str | Sequence[int | str],
+    *,
+    output_root: Path,
+    fetcher: Callable[[str], bytes] = download_json_bytes,
+) -> CombinedDownloadBatchResult:
+    """Reuse or download both sides, then publish combined aggregations."""
+
+    normalized_instrument = validate_instrument(instrument)
+    normalized_aggregations = validate_aggregations(aggregation_minutes)
+    normalized_root = Path(output_root)
+
+    raw_by_side: dict[str, tuple[bytes, Path, bool]] = {}
+    for side in ("BID", "ASK"):
+        raw_by_side[side] = _load_or_download_raw(
+            normalized_instrument,
+            side,
+            requested_date,
+            output_root=normalized_root,
+            fetcher=fetcher,
+        )
+
+    bid_bytes, bid_json_path, bid_was_downloaded = raw_by_side["BID"]
+    ask_bytes, ask_json_path, ask_was_downloaded = raw_by_side["ASK"]
+    bid_candles = decode_json_bytes(bid_bytes)
+    ask_candles = decode_json_bytes(ask_bytes)
+    combine_candles(bid_candles, ask_candles)
+
+    raw_downloaded_sides = tuple(
+        side
+        for side, was_downloaded in (
+            ("BID", bid_was_downloaded),
+            ("ASK", ask_was_downloaded),
+        )
+        if was_downloaded
+    )
+    raw_cached_sides = tuple(
+        side
+        for side, was_downloaded in (
+            ("BID", bid_was_downloaded),
+            ("ASK", ask_was_downloaded),
+        )
+        if not was_downloaded
+    )
+
+    if not bid_candles:
+        for raw_bytes, destination, was_downloaded in raw_by_side.values():
+            if was_downloaded:
+                _write_raw_json(raw_bytes, destination)
+        return CombinedDownloadBatchResult(
+            json_paths=(bid_json_path, ask_json_path),
+            parquet_paths=(),
+            minute_count=0,
+            raw_downloaded_sides=raw_downloaded_sides,
+            raw_cached_sides=raw_cached_sides,
+            created_aggregations=(),
+            skipped_aggregations=(),
+        )
+
+    published_parquet: list[Path] = []
+    created_aggregations: list[int] = []
+    skipped_aggregations: list[int] = []
+    written_raw_paths: list[Path] = []
+    try:
+        for aggregation in normalized_aggregations:
+            aggregated_candles = aggregate_combined_candles(
+                bid_candles,
+                ask_candles,
+                aggregation,
+            )
+            output_paths = combined_parquet_output_paths(
+                aggregated_candles,
+                normalized_root,
+                normalized_instrument,
+                requested_date,
+                aggregation,
+            )
+            if any(path.exists() for path in output_paths):
+                skipped_aggregations.append(aggregation)
+                continue
+
+            published_parquet.extend(
+                write_combined_parquet(
+                    aggregated_candles,
+                    normalized_root,
+                    normalized_instrument,
+                    requested_date,
+                    aggregation,
+                )
+            )
+            created_aggregations.append(aggregation)
+
+        for raw_bytes, destination, was_downloaded in raw_by_side.values():
+            if was_downloaded:
+                _write_raw_json(raw_bytes, destination)
+                written_raw_paths.append(destination)
+    except Exception:
+        for path in published_parquet:
+            path.unlink(missing_ok=True)
+        for path in written_raw_paths:
+            path.unlink(missing_ok=True)
+        raise
+
+    return CombinedDownloadBatchResult(
+        json_paths=(bid_json_path, ask_json_path),
+        parquet_paths=tuple(published_parquet),
+        minute_count=len(bid_candles),
+        raw_downloaded_sides=raw_downloaded_sides,
+        raw_cached_sides=raw_cached_sides,
+        created_aggregations=tuple(created_aggregations),
+        skipped_aggregations=tuple(skipped_aggregations),
+    )
+
+
 def run_download(
     instrument: str,
     side: str,
@@ -725,9 +1118,10 @@ def run_download(
 ) -> tuple[Path, list[Path], int]:
     """Process one aggregation while preserving the original return shape."""
 
+    normalized_side = validate_side(side)
     result = run_downloads(
         instrument,
-        side,
+        normalized_side,
         requested_date,
         (aggregation_minutes,),
         output_root=output_root,
@@ -750,12 +1144,13 @@ def run_date_range(
     if not requested_dates:
         raise ValueError("at least one requested date is required")
 
+    normalized_side = validate_download_side(side)
     outcomes: list[DateRunOutcome] = []
     for requested_date in requested_dates:
         try:
             result = run_downloads(
                 instrument,
-                side,
+                normalized_side,
                 requested_date,
                 aggregation_minutes,
                 output_root=output_root,
@@ -766,4 +1161,3 @@ def run_date_range(
         else:
             outcomes.append(DateRunOutcome(requested_date, result, None))
     return tuple(outcomes)
-
