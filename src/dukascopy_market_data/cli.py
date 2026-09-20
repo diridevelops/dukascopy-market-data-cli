@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Callable, Sequence
@@ -13,11 +14,13 @@ from .candles import (
     parse_date,
     resolve_requested_dates,
     run_date_range,
+    run_downloads,
     validate_aggregations,
     validate_download_side,
     validate_instrument,
 )
 from .instruments import fetch_instrument_codes
+from .ticks import TickDateResult, run_tick_date, resolve_hours, validate_hour
 
 
 def _date_argument(value: str) -> date:
@@ -48,6 +51,13 @@ def _aggregations_argument(value: str) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _hour_argument(value: str) -> int:
+    try:
+        return validate_hour(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _add_download_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--instrument", required=True, type=_instrument_argument)
     parser.add_argument(
@@ -62,9 +72,24 @@ def _add_download_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--end-date", type=_date_argument)
     parser.add_argument(
         "--aggregation",
-        required=True,
         type=_aggregations_argument,
-        help="comma-separated positive aggregation sizes in minutes, for example 1,5,15",
+        help="comma-separated positive aggregation sizes in minutes; required for candles",
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--only-ticks",
+        action="store_true",
+        help="download only hourly ticks; --aggregation is not used",
+    )
+    mode_group.add_argument(
+        "--include-ticks",
+        action="store_true",
+        help="download candles and all 24 tick hours for each date",
+    )
+    parser.add_argument(
+        "--hour",
+        type=_hour_argument,
+        help="tick hour 0-23; valid only with --only-ticks (default: all hours)",
     )
 
 
@@ -82,8 +107,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     download_parser = subparsers.add_parser(
         "download",
-        help="download and aggregate compressed minute candles",
-        description="Download and aggregate compressed Dukascopy minute candles.",
+        help="download Dukascopy candles and/or hourly ticks",
+        description="Download Dukascopy candles and/or compressed hourly ticks.",
     )
     _add_download_arguments(download_parser)
     return parser
@@ -93,7 +118,7 @@ def _print_download_results(outcomes) -> int:
     for outcome in outcomes:
         date_label = outcome.requested_date.isoformat()
         if outcome.error is not None:
-            print(f"[{date_label}] ERROR: {outcome.error}", file=sys.stderr)
+            print(f"[{date_label}] ERROR: {_path_free_error_text(outcome.error)}", file=sys.stderr)
             continue
 
         result = outcome.result
@@ -157,6 +182,185 @@ def _print_download_results(outcomes) -> int:
     return 1 if failed_count else 0
 
 
+@dataclass(frozen=True)
+class _ExtendedDateOutcome:
+    """One date result for candle-plus-tick or tick-only processing."""
+
+    requested_date: date
+    candle_result: object | None
+    tick_result: TickDateResult | None
+    error: str | None
+
+
+def _path_free_error_text(message: str) -> str:
+    """Keep local filesystem paths out of user-facing status logs."""
+
+    lowered = message.lower()
+    if "refusing to overwrite existing" in lowered:
+        return "existing output artifact"
+    if "permission denied" in lowered or "access is denied" in lowered:
+        return "filesystem permission error while writing output"
+    return message
+
+
+def _run_extended_date_range(
+    instrument: str,
+    side: str,
+    requested_dates: Sequence[date],
+    aggregation: tuple[int, ...] | None,
+    *,
+    include_ticks: bool,
+    only_ticks: bool,
+    tick_hours: Sequence[int],
+    output_root: Path,
+    fetcher: Callable[[str], bytes],
+) -> tuple[_ExtendedDateOutcome, ...]:
+    outcomes: list[_ExtendedDateOutcome] = []
+    for requested_date in requested_dates:
+        candle_result = None
+        tick_result = None
+        errors: list[str] = []
+
+        if not only_ticks:
+            assert aggregation is not None
+            try:
+                candle_result = run_downloads(
+                    instrument,
+                    side,
+                    requested_date,
+                    aggregation,
+                    output_root=output_root,
+                    fetcher=fetcher,
+                )
+            except Exception as exc:
+                errors.append(f"candles: {_path_free_error_text(str(exc))}")
+
+        if only_ticks or include_ticks:
+            try:
+                tick_result = run_tick_date(
+                    instrument,
+                    requested_date,
+                    tick_hours,
+                    output_root=output_root,
+                    fetcher=fetcher,
+                )
+            except Exception as exc:
+                errors.append(f"ticks: {_path_free_error_text(str(exc))}")
+            else:
+                for failed_hour in tick_result.failed_hours:
+                    assert failed_hour.error is not None
+                    errors.append(
+                        f"ticks hour {failed_hour.hour:02d}: "
+                        f"{_path_free_error_text(failed_hour.error)}"
+                    )
+
+        outcomes.append(
+            _ExtendedDateOutcome(
+                requested_date=requested_date,
+                candle_result=candle_result,
+                tick_result=tick_result,
+                error="; ".join(errors) if errors else None,
+            )
+        )
+    return tuple(outcomes)
+
+
+def _print_extended_download_results(outcomes: Sequence[_ExtendedDateOutcome]) -> int:
+    for outcome in outcomes:
+        date_label = outcome.requested_date.isoformat()
+        if outcome.error is not None:
+            print(f"[{date_label}] ERROR: {_path_free_error_text(outcome.error)}", file=sys.stderr)
+
+        candle_result = outcome.candle_result
+        if candle_result is not None:
+            if candle_result.minute_count == 0:
+                print(f"[{date_label}] {candle_result.source_message}; no candles (empty date)")
+            else:
+                print(
+                    f"[{date_label}] {candle_result.source_message} and decoded "
+                    f"{candle_result.minute_count} minute candles"
+                )
+                if candle_result.created_aggregations:
+                    created = ", ".join(
+                        f"{aggregation}m" for aggregation in candle_result.created_aggregations
+                    )
+                    print(f"[{date_label}] Created aggregations: {created}")
+                if candle_result.skipped_aggregations:
+                    skipped = ", ".join(
+                        f"{aggregation}m" for aggregation in candle_result.skipped_aggregations
+                    )
+                    print(f"[{date_label}] Skipped existing aggregations: {skipped}")
+
+        tick_result = outcome.tick_result
+        if tick_result is not None:
+            print(
+                f"[{date_label}] Ticks: decoded={tick_result.tick_count} "
+                f"created_hours={len(tick_result.created_hours)} "
+                f"skipped_hours={len(tick_result.skipped_hours)} "
+                f"empty_hours={len(tick_result.empty_hours)} "
+                f"failed_hours={len(tick_result.failed_hours)}"
+            )
+
+    failed_dates = [
+        outcome.requested_date.isoformat() for outcome in outcomes if outcome.error is not None
+    ]
+    empty_dates: list[str] = []
+    skipped_dates: list[str] = []
+    created_aggregation_count = 0
+    skipped_aggregation_count = 0
+    created_tick_hour_count = 0
+    skipped_tick_hour_count = 0
+
+    for outcome in outcomes:
+        candle_result = outcome.candle_result
+        tick_result = outcome.tick_result
+        if candle_result is not None:
+            created_aggregation_count += len(candle_result.created_aggregations)
+            skipped_aggregation_count += len(candle_result.skipped_aggregations)
+        if tick_result is not None:
+            created_tick_hour_count += len(tick_result.created_hours)
+            skipped_tick_hour_count += len(tick_result.skipped_hours)
+
+        if outcome.error is not None:
+            continue
+
+        has_candle_data = candle_result is not None and candle_result.minute_count > 0
+        has_tick_data = tick_result is not None and tick_result.has_data
+        if not has_candle_data and not has_tick_data:
+            empty_dates.append(outcome.requested_date.isoformat())
+            continue
+
+        has_created_output = (
+            candle_result is not None and bool(candle_result.created_aggregations)
+        ) or (tick_result is not None and bool(tick_result.created_hours))
+        has_skipped_output = (
+            candle_result is not None and bool(candle_result.skipped_aggregations)
+        ) or (tick_result is not None and bool(tick_result.skipped_hours))
+        if not has_created_output and has_skipped_output:
+            skipped_dates.append(outcome.requested_date.isoformat())
+
+    empty_count = len(empty_dates)
+    failed_count = len(failed_dates)
+    skipped_count = len(skipped_dates)
+    successful_count = len(outcomes) - empty_count - failed_count - skipped_count
+    print(f"Empty days: {', '.join(empty_dates) if empty_dates else 'none'}")
+    print(f"Failed days: {', '.join(failed_dates) if failed_dates else 'none'}")
+    print(f"Skipped days: {', '.join(skipped_dates) if skipped_dates else 'none'}")
+    print(
+        "Summary: "
+        f"processed={len(outcomes)} "
+        f"successful={successful_count} "
+        f"empty={empty_count} "
+        f"failed={failed_count} "
+        f"skipped={skipped_count} "
+        f"created_aggregations={created_aggregation_count} "
+        f"skipped_aggregations={skipped_aggregation_count} "
+        f"created_tick_hours={created_tick_hour_count} "
+        f"skipped_tick_hours={skipped_tick_hour_count}"
+    )
+    return 1 if failed_count else 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -188,7 +392,35 @@ def main(
     except ValueError as exc:
         parser.error(str(exc))
 
+    if arguments.only_ticks:
+        if arguments.aggregation is not None:
+            parser.error("--aggregation cannot be combined with --only-ticks")
+        if arguments.hour is None:
+            tick_hours = resolve_hours(None)
+        else:
+            tick_hours = (arguments.hour,)
+    else:
+        if arguments.aggregation is None:
+            parser.error("--aggregation is required unless --only-ticks is used")
+        if arguments.hour is not None:
+            parser.error("--hour is valid only with --only-ticks")
+        tick_hours = resolve_hours(None)
+
     resolved_output_root = Path.cwd() if output_root is None else Path(output_root)
+    if arguments.only_ticks or arguments.include_ticks:
+        outcomes = _run_extended_date_range(
+            arguments.instrument,
+            arguments.side,
+            requested_dates,
+            arguments.aggregation,
+            include_ticks=arguments.include_ticks,
+            only_ticks=arguments.only_ticks,
+            tick_hours=tick_hours,
+            output_root=resolved_output_root,
+            fetcher=fetcher,
+        )
+        return _print_extended_download_results(outcomes)
+
     outcomes = run_date_range(
         arguments.instrument,
         arguments.side,
