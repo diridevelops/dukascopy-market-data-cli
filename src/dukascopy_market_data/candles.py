@@ -555,9 +555,13 @@ def raw_json_path(output_root: Path, instrument: str, requested_date: date, side
 
     return (
         output_root
-        / "candles"
-        / "minute"
+        / "artifacts"
+        / f"instrument={instrument}"
         / "json"
+        / "minute"
+        / f"year={requested_date.year:04d}"
+        / f"month={requested_date.month:02d}"
+        / f"day={requested_date.day:02d}"
         / f"{instrument}-{requested_date.isoformat()}-{side}.json"
     )
 
@@ -582,8 +586,9 @@ def parquet_output_paths(
         partition_date = _partition_date(candle.timestamp_ms)
         partition_dir = (
             output_root
-            / "candles"
-            / f"{aggregation_minutes}m"
+            / "artifacts"
+            / f"instrument={instrument}"
+            / f"tf={aggregation_minutes}m"
             / f"year={partition_date.year:04d}"
             / f"month={partition_date.month:02d}"
             / f"day={partition_date.day:02d}"
@@ -607,8 +612,9 @@ def combined_parquet_output_paths(
         partition_date = _partition_date(candle.timestamp_ms)
         partition_dir = (
             output_root
-            / "candles"
-            / f"{aggregation_minutes}m"
+            / "artifacts"
+            / f"instrument={instrument}"
+            / f"tf={aggregation_minutes}m"
             / f"year={partition_date.year:04d}"
             / f"month={partition_date.month:02d}"
             / f"day={partition_date.day:02d}"

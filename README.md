@@ -20,7 +20,7 @@ The project declares PyArrow in `pyproject.toml`. Use `uv run` for the project e
 │       ├── cli.py
 │       └── instruments.py
 ├── tests/
-└── candles/
+└── artifacts/
 ```
 
 Run commands from the root directory:
@@ -132,19 +132,23 @@ Missing source minutes do not create synthetic candles. Partial final buckets ar
 
 ## Output layout
 
-Outputs are written below `market-data/candles/`:
+Outputs are written below `artifacts/`:
 
 ```text
-candles/
-├── minute/
-│   └── json/
-│       ├── EUR-USD-2026-09-13-BID.json
-│       └── EUR-USD-2026-09-13-ASK.json
-└── 15m/
-    └── year=2026/
-        └── month=09/
-            └── day=13/
-                └── EUR-USD-2026-09-13-COMB.parquet
+artifacts/
+└── instrument=EUR-USD/
+    ├── json/
+    │   └── minute/
+    │       └── year=2026/
+    │           └── month=09/
+    │               └── day=13/
+    │                   ├── EUR-USD-2026-09-13-BID.json
+    │                   └── EUR-USD-2026-09-13-ASK.json
+    └── tf=15m/
+        └── year=2026/
+            └── month=09/
+                └── day=13/
+                    └── EUR-USD-2026-09-13-COMB.parquet
 ```
 
 `COMB` Parquet columns are:
@@ -160,7 +164,9 @@ candles/
 `close`, and `volume` columns and include the corresponding side suffix in
 their filenames.
 
-Hive partition directories use the UTC date of each aggregate bucket. The raw JSON preserves the exact validated response bytes.
+Hive partition directories use the UTC date of each aggregate bucket. Raw JSON
+directories use the requested endpoint date. The raw JSON preserves the exact
+validated response bytes.
 
 ## Rerunning downloads
 
@@ -170,6 +176,9 @@ aggregation is requested for an existing raw JSON file, the file is validated
 locally and reused without another network request.
 
 Existing target Parquet aggregations are skipped; missing aggregations are created. Existing raw JSON and Parquet files are never overwritten. Refreshing source data requires deliberately removing the relevant raw JSON and derived outputs before rerunning. Invalid cached JSON is rejected rather than silently redownloaded.
+
+The current layout is rooted at `artifacts/`. Existing files under the legacy
+`candles/` directory are left untouched and are not migrated or reused.
 
 Valid empty endpoint responses, such as weekends, are cached without creating Parquet files and are reported as empty dates.
 

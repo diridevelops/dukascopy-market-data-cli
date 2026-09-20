@@ -227,8 +227,49 @@ class DukascopyCandleTests(unittest.TestCase):
         )
         self.assertEqual(
             raw_json_path(Path("output"), "EUR-USD", REQUESTED_DATE, "BID").as_posix(),
-            "output/candles/minute/json/EUR-USD-2026-09-13-BID.json",
+            "output/artifacts/instrument=EUR-USD/json/minute/year=2026/month=09/day=13/EUR-USD-2026-09-13-BID.json",
         )
+
+    def test_legacy_candles_files_are_not_reused_by_artifacts_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            legacy_raw = (
+                output_root
+                / "candles"
+                / "minute"
+                / "json"
+                / "EUR-USD-2026-09-13-BID.json"
+            )
+            legacy_raw.parent.mkdir(parents=True)
+            legacy_raw.write_bytes(b"legacy raw")
+            legacy_parquet = (
+                output_root
+                / "candles"
+                / "15m"
+                / "year=2026"
+                / "month=09"
+                / "day=13"
+                / "EUR-USD-2026-09-13-BID.parquet"
+            )
+            legacy_parquet.parent.mkdir(parents=True)
+            legacy_parquet.write_bytes(b"legacy parquet")
+
+            calls: list[str] = []
+            json_path, parquet_paths, minute_count = run_download(
+                "EUR-USD",
+                "BID",
+                REQUESTED_DATE,
+                15,
+                output_root=output_root,
+                fetcher=lambda url: calls.append(url) or sample_bytes(),
+            )
+
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(json_path.is_relative_to(output_root / "artifacts"))
+            self.assertTrue(parquet_paths[0].is_relative_to(output_root / "artifacts"))
+            self.assertEqual(minute_count, 5)
+            self.assertEqual(legacy_raw.read_bytes(), b"legacy raw")
+            self.assertEqual(legacy_parquet.read_bytes(), b"legacy parquet")
 
     def test_instrument_codes_are_sorted_deduplicated_and_exact(self) -> None:
         payload = {
@@ -380,6 +421,8 @@ class DukascopyCandleTests(unittest.TestCase):
             self.assertEqual(len(paths), 1)
             output_path = paths[0]
             self.assertTrue(output_path.exists())
+            self.assertIn("instrument=EUR-USD", str(output_path))
+            self.assertIn("tf=15m", str(output_path))
             self.assertIn("year=2026", str(output_path))
             self.assertIn("month=09", str(output_path))
             self.assertIn("day=13", str(output_path))
@@ -393,9 +436,16 @@ class DukascopyCandleTests(unittest.TestCase):
             self.assertEqual(str(table.schema.field("volume").type), "int64")
             self.assertEqual(table.num_rows, 2)
 
-            dataset = ds.dataset(output_root / "candles" / "15m", format="parquet", partitioning="hive")
+            dataset = ds.dataset(
+                output_root / "artifacts" / "instrument=EUR-USD" / "tf=15m",
+                format="parquet",
+                partitioning="hive",
+            )
             self.assertEqual(dataset.to_table().num_rows, 2)
-            self.assertEqual(set(dataset.schema.names), {"timestamp", "open", "high", "low", "close", "volume", "year", "month", "day"})
+            self.assertEqual(
+                set(dataset.schema.names),
+                {"timestamp", "open", "high", "low", "close", "volume", "year", "month", "day"},
+            )
 
     def test_combined_download_fetches_both_sides_and_writes_combined_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -536,8 +586,9 @@ class DukascopyCandleTests(unittest.TestCase):
             self.assertTrue(
                 (
                     output_root
-                    / "candles"
-                    / "15m"
+                    / "artifacts"
+                    / "instrument=EUR-USD"
+                    / "tf=15m"
                     / "year=2026"
                     / "month=09"
                     / "day=13"
@@ -634,8 +685,9 @@ class DukascopyCandleTests(unittest.TestCase):
             for requested_date in (first_date, second_date):
                 parquet_path = (
                     output_root
-                    / "candles"
-                    / "15m"
+                    / "artifacts"
+                    / "instrument=EUR-USD"
+                    / "tf=15m"
                     / "year=2026"
                     / "month=09"
                     / f"day={requested_date.day:02d}"
@@ -777,7 +829,15 @@ class DukascopyCandleTests(unittest.TestCase):
             self.assertIsNone(outcomes[2].result)
             self.assertEqual(outcomes[2].error, "simulated network failure")
             self.assertTrue(
-                (output_root / "candles" / "15m" / "year=2026" / "month=09" / "day=11").exists()
+                (
+                    output_root
+                    / "artifacts"
+                    / "instrument=EUR-USD"
+                    / "tf=15m"
+                    / "year=2026"
+                    / "month=09"
+                    / "day=11"
+                ).exists()
             )
             self.assertTrue(raw_json_path(output_root, "EUR-USD", first_date, "BID").exists())
             self.assertTrue(raw_json_path(output_root, "EUR-USD", empty_date, "BID").exists())
