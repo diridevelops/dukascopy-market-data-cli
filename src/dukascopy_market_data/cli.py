@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -90,6 +92,17 @@ def _add_download_arguments(parser: argparse.ArgumentParser) -> None:
         "--hour",
         type=_hour_argument,
         help="tick hour 0-23; valid only with --only-ticks (default: all hours)",
+    )
+    parser.add_argument(
+        "--csv",
+        action="store_true",
+        help="write derived candle and tick data as CSV instead of Parquet",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="PATH",
+        help="exact output root; missing directories and parents are created",
     )
 
 
@@ -200,7 +213,42 @@ def _path_free_error_text(message: str) -> str:
         return "existing output artifact"
     if "permission denied" in lowered or "access is denied" in lowered:
         return "filesystem permission error while writing output"
+    if (
+        "cannot find" in lowered
+        or "no such file" in lowered
+        or "not a directory" in lowered
+    ):
+        return "filesystem path error while writing output"
     return message
+
+
+def _resolve_output_root(output_option: str | None, output_override: Path | None) -> Path:
+    """Resolve the exact output root used by a download invocation."""
+
+    if output_option is not None:
+        candidate = Path(output_option).expanduser()
+    elif output_override is not None:
+        candidate = Path(output_override).expanduser()
+    else:
+        candidate = Path.cwd() / "output"
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    return candidate.resolve()
+
+
+def _ensure_output_root(path: Path) -> Path:
+    """Create and write-probe an output root before starting network work."""
+
+    try:
+        if path.exists() and not path.is_dir():
+            raise OSError("output location is not a directory")
+        path.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".output-write-test-", dir=path)
+        os.close(descriptor)
+        Path(temporary_name).unlink(missing_ok=True)
+    except OSError as exc:
+        raise OSError("output location cannot be written") from exc
+    return path
 
 
 def _run_extended_date_range(
@@ -214,6 +262,7 @@ def _run_extended_date_range(
     tick_hours: Sequence[int],
     output_root: Path,
     fetcher: Callable[[str], bytes],
+    output_format: str,
 ) -> tuple[_ExtendedDateOutcome, ...]:
     outcomes: list[_ExtendedDateOutcome] = []
     for requested_date in requested_dates:
@@ -231,6 +280,7 @@ def _run_extended_date_range(
                     aggregation,
                     output_root=output_root,
                     fetcher=fetcher,
+                    output_format=output_format,
                 )
             except Exception as exc:
                 errors.append(f"candles: {_path_free_error_text(str(exc))}")
@@ -243,6 +293,7 @@ def _run_extended_date_range(
                     tick_hours,
                     output_root=output_root,
                     fetcher=fetcher,
+                    output_format=output_format,
                 )
             except Exception as exc:
                 errors.append(f"ticks: {_path_free_error_text(str(exc))}")
@@ -406,7 +457,14 @@ def main(
             parser.error("--hour is valid only with --only-ticks")
         tick_hours = resolve_hours(None)
 
-    resolved_output_root = Path.cwd() if output_root is None else Path(output_root)
+    output_format = "csv" if arguments.csv else "parquet"
+    try:
+        resolved_output_root = _ensure_output_root(
+            _resolve_output_root(arguments.output, output_root)
+        )
+    except OSError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     if arguments.only_ticks or arguments.include_ticks:
         outcomes = _run_extended_date_range(
             arguments.instrument,
@@ -418,6 +476,7 @@ def main(
             tick_hours=tick_hours,
             output_root=resolved_output_root,
             fetcher=fetcher,
+            output_format=output_format,
         )
         return _print_extended_download_results(outcomes)
 
@@ -428,5 +487,6 @@ def main(
         arguments.aggregation,
         output_root=resolved_output_root,
         fetcher=fetcher,
+        output_format=output_format,
     )
     return _print_download_results(outcomes)

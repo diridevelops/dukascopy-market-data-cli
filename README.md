@@ -1,11 +1,15 @@
-# Dukascopy market-data CLI
+# Dukascopy market-data downloader CLI
 
-This project provides two commands:
+A command-line tool for downloading historical market data from the [Dukascopy](https://www.dukascopy.com) public endpoint.
+
+It offers functionality similar to Dukascopy's [Historical Data Export](https://www.dukascopy.com/swiss/english/marketwatch/historical/) webpage, with additional support for conveniently downloading arbitrary date ranges and integrating data retrieval into scripts and automated workflows.
+
+> This project is not affiliated with or endorsed by Dukascopy.
+
+The CLI provides two commands:
 
 - `instruments` fetches the current Dukascopy instrument catalogue and prints one exact instrument code per line.
-- `download` downloads compressed Dukascopy minute candles and/or hourly tick data, expands the deltas, and writes Hive-partitioned Parquet files.
-
-The project declares PyArrow in `pyproject.toml`. Use `uv run` for the project environment, or `uv run --active` when you want to use the currently active virtual environment.
+- `download` downloads compressed Dukascopy minute candles and/or hourly tick data, expands the deltas, and writes Hive-partitioned Parquet or CSV files.
 
 ## Project layout
 
@@ -21,7 +25,7 @@ The project declares PyArrow in `pyproject.toml`. Use `uv run` for the project e
 │       ├── instruments.py
 │       └── ticks.py
 ├── tests/
-└── artifacts/
+└── output/
 ```
 
 Run commands from the root directory:
@@ -77,6 +81,39 @@ uv run dukascopy download \
   --aggregation 1,5,15
 ```
 
+By default, derived data is written below `./output`. To write CSV instead of
+Parquet, add `--csv`:
+
+```bash
+uv run dukascopy download \
+  --instrument EUR-USD \
+  --date 2026-09-13 \
+  --aggregation 1,5,15 \
+  --csv
+```
+
+Use `-o` or `--output` to select the exact output root. The path may be
+relative or absolute; relative paths are resolved from the current working
+directory, and missing parents are created:
+
+```bash
+uv run dukascopy download \
+  --instrument EUR-USD \
+  --date 2026-09-13 \
+  --aggregation 15 \
+  --output ./data
+```
+
+For example, an absolute home-directory path in Bash is also accepted:
+
+```bash
+uv run dukascopy download \
+  --instrument EUR-USD \
+  --date 2026-09-13 \
+  --aggregation 15 \
+  --output "$HOME/Downloads/data"
+```
+
 When `--side` is omitted, it defaults to `COMB` and downloads or reuses both
 the BID and ASK source responses. To request a mode explicitly:
 
@@ -108,6 +145,8 @@ The download arguments are:
 | `--only-ticks` | Download only tick data. It cannot be combined with `--include-ticks` or `--aggregation`. | flag |
 | `--include-ticks` | Download candles and all 24 tick hours for every requested date. | flag |
 | `--hour` | Tick hour from `0` through `23`; valid only with `--only-ticks`. Without it, all hours are downloaded. | `1` |
+| `--csv` | Write derived candle and tick data as CSV instead of Parquet. Raw JSON caches are unchanged. | flag |
+| `-o`, `--output` | Exact output root. Relative paths use the current working directory; missing parents are created. | `./data` |
 
 Use `--help` for the complete command syntax:
 
@@ -142,7 +181,7 @@ uv run dukascopy download \
   --include-ticks
 ```
 
-Dates in a range are processed sequentially and independently. Each date has its own raw JSON cache and Parquet outputs. A failure for one date or tick hour is reported while later dates and hours continue processing; the final exit status is `1` if any date/hour failed and `0` if all requested work succeeded or was validly empty. Download logging reports created and skipped aggregations/hours without printing local filesystem paths. Before the final summary it lists the empty, failed, and fully skipped dates.
+Dates in a range are processed sequentially and independently. Each date has its own raw JSON cache and derived outputs. A failure for one date or tick hour is reported while later dates and hours continue processing; the final exit status is `1` if any date/hour failed and `0` if all requested work succeeded or was validly empty. Download logging reports created and skipped aggregations/hours without printing local filesystem paths. Before the final summary it lists the empty, failed, and fully skipped dates.
 
 ## Decoding and aggregation
 
@@ -176,6 +215,11 @@ Tick Parquet columns are:
 | `bidPrice`, `askPrice` | `float64` | Best bid and ask prices |
 | `bidVolume`, `askVolume` | `int64` | Quoted liquidity at the best bid and ask |
 
+With `--csv`, tick files use the same five columns and order. CSV timestamps
+are ISO-8601 UTC values with millisecond precision, such as
+`2026-09-01T01:00:00.010Z`. CSV price and volume fields are written as decimal
+and integer text respectively.
+
 These volumes are quoted liquidity, not completed transaction volume:
 
 - **`bidVolumes[i]`** is the quantity available from buyers at the current best bid.
@@ -189,10 +233,12 @@ for the API definition of best bid/ask volume.
 
 ## Output layout
 
-Outputs are written below `artifacts/`:
+By default, outputs are written below `output/`. The same layout is used for
+CSV; only the derived filename extension changes from `.parquet` to `.csv`.
+An explicit `--output PATH` replaces `output/` with the selected path:
 
 ```text
-artifacts/
+output/
 └── instrument=EUR-USD/
     ├── json/
     │   ├── minute/
@@ -219,6 +265,12 @@ artifacts/
                         └── EUR-USD-2026-09-13-01-TICKS.parquet
 ```
 
+For CSV output, the equivalent files are named
+`EUR-USD-2026-09-13-COMB.csv` and
+`EUR-USD-2026-09-13-01-TICKS.csv` in the same partition directories.
+All candle and tick CSV timestamp columns use ISO-8601 UTC text with
+millisecond precision.
+
 `COMB` Parquet columns are:
 
 | Column | Type | Meaning |
@@ -228,15 +280,18 @@ artifacts/
 | `askOpen`, `askHigh`, `askLow`, `askClose` | `float64` | Aggregated ASK prices |
 | `bidVolume`, `askVolume` | `int64` | Summed side-specific volume in units |
 
+COMB CSV files use the same eleven columns and order; only the timestamp is
+serialized as ISO-8601 UTC text.
+
 `BID` and `ASK` Parquet files retain the existing `open`, `high`, `low`,
 `close`, and `volume` columns and include the corresponding side suffix in
-their filenames.
+their filenames. Their CSV equivalents use the same column names and order.
 
 Hive partition directories use the UTC date of each aggregate bucket. Raw JSON
-directories use the requested endpoint date. Tick Parquet directories use the
-requested endpoint date and zero-padded hour. Raw JSON preserves the exact
-validated response bytes. Tick JSON and Parquet contain both bid and ask data;
-`--side` does not select a tick-only side.
+directories use the requested endpoint date. Tick derived-data directories use
+the requested endpoint date and zero-padded hour. Raw JSON preserves the exact
+validated response bytes. Tick JSON, Parquet, and CSV contain both bid and ask
+data; `--side` does not select a tick-only side.
 
 ## Rerunning downloads
 
@@ -246,16 +301,18 @@ the BID and ASK JSON files are cached independently. If a new aggregation or
 tick output is requested for an existing raw JSON file, the file is validated
 locally and reused without another network request.
 
-Existing target Parquet aggregations and tick-hour files are skipped; missing
-outputs are created. Existing raw JSON and Parquet files are never overwritten.
-Refreshing source data requires deliberately removing the relevant raw JSON and
-derived outputs before rerunning. Invalid cached JSON is rejected rather than
-silently redownloaded.
+Existing target files in the selected format are skipped; missing outputs are
+created. Parquet and CSV targets are independent, so an existing Parquet file
+does not block a later CSV request and vice versa. Existing raw JSON and
+derived files are never overwritten. Refreshing source data requires
+deliberately removing the relevant raw JSON and derived outputs before
+rerunning. Invalid cached JSON is rejected rather than silently redownloaded.
 
-The current layout is rooted at `artifacts/`. Existing files under the legacy
-`candles/` directory are left untouched and are not migrated or reused.
+The current default layout is rooted at `output/`. Existing files under the
+legacy `candles/` or former `artifacts/` directories are left untouched and
+are not migrated or reused.
 
-Valid empty candle days and tick hours are cached without creating Parquet
+Valid empty candle days and tick hours are cached without creating derived
 files. They are reported as empty work rather than failures.
 
 ## Tests
@@ -272,7 +329,7 @@ To run the same suite with the active virtual environment:
 uv run --active python -m unittest discover -s ./tests -p 'test_*.py' -v
 ```
 
-The tests cover subcommand dispatch, no-subcommand help, instrument-code decoding and validation, exact dotted/mixed-case codes, candle and tick URL formation, compressed candle/tick decoding, empty days and hours, date ranges, cached-JSON reuse, BID/ASK/COMB modes, positional side matching, sparse aggregation, one-row-per-tick output, UTC Parquet schemas, Hive partitions, failure continuation, and no-overwrite behavior.
+The tests cover subcommand dispatch, no-subcommand help, instrument-code decoding and validation, exact dotted/mixed-case codes, candle and tick URL formation, compressed candle/tick decoding, empty days and hours, date ranges, cached-JSON reuse, BID/ASK/COMB modes, positional side matching, sparse aggregation, one-row-per-tick output, UTC Parquet schemas, ISO-8601 CSV output, configurable output roots, Hive partitions, failure continuation, format-specific collisions, and no-overwrite behavior.
 
 ## Common errors
 
@@ -280,9 +337,10 @@ The tests cover subcommand dispatch, no-subcommand help, instrument-code decodin
 - **Invalid instrument code**: run `instruments` and copy the exact code, including case and dots.
 - **Invalid side**: use `COMB`, `BID`, or `ASK`; omitting `--side` is equivalent to `COMB`.
 - **Invalid tick flags**: `--only-ticks` must omit `--aggregation`; `--include-ticks` requires `--aggregation`; `--hour` is valid only with `--only-ticks`.
-- **Existing Parquet output**: the requested aggregation is skipped; no overwrite occurs.
+- **Existing output**: the requested aggregation or tick hour is skipped when the same format already exists; Parquet and CSV outputs are independent.
+- **Output location**: the default is `./output`; `--output` creates missing parents but returns an error if the location is a file or cannot be written.
 - **Invalid cached JSON**: the source cache is malformed or violates the endpoint contract; remove it deliberately before retrying a fresh download.
-- **Empty date**: the endpoint returned a valid response with no candles; this is reported and creates no Parquet output.
-- **Empty tick hour**: the endpoint returned a valid empty hourly response; its JSON is cached and no tick Parquet file is created.
+- **Empty date**: the endpoint returned a valid response with no candles; this is reported and creates no derived output.
+- **Empty tick hour**: the endpoint returned a valid empty hourly response; its JSON is cached and no tick derived file is created.
 - **Range failure**: the failed date is reported, other dates continue, and the process exits with status `1`.
 - **HTTP or connection error**: check network access. Transient connection failures and selected HTTP statuses are retried automatically.

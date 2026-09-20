@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import tempfile
@@ -21,6 +22,8 @@ from .candles import (
     _as_int,
     _write_raw_json,
     download_json_bytes,
+    format_timestamp_utc,
+    validate_output_format,
     validate_instrument,
 )
 
@@ -48,11 +51,24 @@ class TickHourResult:
     requested_date: date
     hour: int
     json_path: Path
-    parquet_path: Path | None
+    output_path: Path | None
     tick_count: int
     raw_was_downloaded: bool
     parquet_created: bool
     parquet_skipped: bool
+    output_format: str = "parquet"
+
+    @property
+    def parquet_path(self) -> Path | None:
+        """Backward-compatible Parquet path view."""
+
+        return self.output_path if self.output_format == "parquet" else None
+
+    @property
+    def csv_path(self) -> Path | None:
+        """Return the generated CSV path for CSV output."""
+
+        return self.output_path if self.output_format == "csv" else None
 
     @property
     def is_empty(self) -> bool:
@@ -166,7 +182,6 @@ def tick_json_path(
     normalized_hour = validate_hour(hour)
     return (
         Path(output_root)
-        / "artifacts"
         / f"instrument={normalized_instrument}"
         / "json"
         / "ticks"
@@ -174,6 +189,31 @@ def tick_json_path(
         / f"month={requested_date.month:02d}"
         / f"day={requested_date.day:02d}"
         / f"{normalized_instrument}-{requested_date.isoformat()}-{normalized_hour:02d}-TICKS.json"
+    )
+
+
+def tick_output_path(
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    hour: int | str,
+    output_format: str = "parquet",
+) -> Path:
+    """Return the one-file-per-hour tick output path."""
+
+    normalized_instrument = validate_instrument(instrument)
+    normalized_hour = validate_hour(hour)
+    normalized_format = validate_output_format(output_format)
+    extension = ".csv" if normalized_format == "csv" else ".parquet"
+    return (
+        Path(output_root)
+        / f"instrument={normalized_instrument}"
+        / "tf=1tick"
+        / f"year={requested_date.year:04d}"
+        / f"month={requested_date.month:02d}"
+        / f"day={requested_date.day:02d}"
+        / f"hour={normalized_hour:02d}"
+        / f"{normalized_instrument}-{requested_date.isoformat()}-{normalized_hour:02d}-TICKS{extension}"
     )
 
 
@@ -185,19 +225,18 @@ def tick_parquet_path(
 ) -> Path:
     """Return the one-file-per-hour tick Parquet path."""
 
-    normalized_instrument = validate_instrument(instrument)
-    normalized_hour = validate_hour(hour)
-    return (
-        Path(output_root)
-        / "artifacts"
-        / f"instrument={normalized_instrument}"
-        / "tf=1tick"
-        / f"year={requested_date.year:04d}"
-        / f"month={requested_date.month:02d}"
-        / f"day={requested_date.day:02d}"
-        / f"hour={normalized_hour:02d}"
-        / f"{normalized_instrument}-{requested_date.isoformat()}-{normalized_hour:02d}-TICKS.parquet"
-    )
+    return tick_output_path(output_root, instrument, requested_date, hour, "parquet")
+
+
+def tick_csv_path(
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    hour: int | str,
+) -> Path:
+    """Return the one-file-per-hour tick CSV path."""
+
+    return tick_output_path(output_root, instrument, requested_date, hour, "csv")
 
 
 def _require_field(payload: Mapping[str, Any], field: str) -> Any:
@@ -443,6 +482,58 @@ def write_ticks_parquet(
             temporary_path.unlink(missing_ok=True)
 
 
+def write_ticks_csv(
+    ticks: Sequence[Tick],
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    hour: int | str,
+) -> Path:
+    """Write one tick CSV file atomically without overwriting."""
+
+    if not ticks:
+        raise ValueError("cannot write an empty tick sequence")
+    normalized_instrument = validate_instrument(instrument)
+    normalized_hour = validate_hour(hour)
+    final_path = tick_csv_path(
+        Path(output_root), normalized_instrument, requested_date, normalized_hour
+    )
+    if final_path.exists():
+        raise FileExistsError("refusing to overwrite existing tick CSV output")
+
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=".ticks-csv-",
+        suffix=".tmp",
+        dir=final_path.parent,
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    published = False
+    try:
+        with temporary_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(("timestamp", "bidPrice", "askPrice", "bidVolume", "askVolume"))
+            for tick in ticks:
+                writer.writerow(
+                    (
+                        format_timestamp_utc(tick.timestamp_ms),
+                        str(tick.bid_price),
+                        str(tick.ask_price),
+                        str(tick.bid_volume),
+                        str(tick.ask_volume),
+                    )
+                )
+        if final_path.exists():
+            raise FileExistsError("refusing to overwrite existing tick CSV output")
+        os.replace(temporary_path, final_path)
+        published = True
+        return final_path
+    finally:
+        if not published:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _load_or_download_tick_raw(
     instrument: str,
     requested_date: date,
@@ -469,11 +560,13 @@ def run_tick_hour(
     *,
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
+    output_format: str = "parquet",
 ) -> TickHourResult:
     """Reuse or download, validate, and publish one tick hour."""
 
     normalized_instrument = validate_instrument(instrument)
     normalized_hour = validate_hour(hour)
+    normalized_format = validate_output_format(output_format)
     raw_bytes, json_destination, raw_was_downloaded = _load_or_download_tick_raw(
         normalized_instrument,
         requested_date,
@@ -486,8 +579,8 @@ def run_tick_hour(
         requested_date=requested_date,
         hour=normalized_hour,
     )
-    output_path = tick_parquet_path(
-        Path(output_root), normalized_instrument, requested_date, normalized_hour
+    output_path = tick_output_path(
+        Path(output_root), normalized_instrument, requested_date, normalized_hour, normalized_format
     )
 
     if not ticks:
@@ -497,11 +590,12 @@ def run_tick_hour(
             requested_date=requested_date,
             hour=normalized_hour,
             json_path=json_destination,
-            parquet_path=None,
+            output_path=None,
             tick_count=0,
             raw_was_downloaded=raw_was_downloaded,
             parquet_created=False,
             parquet_skipped=False,
+            output_format=normalized_format,
         )
 
     if output_path.exists():
@@ -511,22 +605,32 @@ def run_tick_hour(
             requested_date=requested_date,
             hour=normalized_hour,
             json_path=json_destination,
-            parquet_path=output_path,
+            output_path=output_path,
             tick_count=len(ticks),
             raw_was_downloaded=raw_was_downloaded,
             parquet_created=False,
             parquet_skipped=True,
+            output_format=normalized_format,
         )
 
     published_path: Path | None = None
     try:
-        published_path = write_ticks_parquet(
-            ticks,
-            Path(output_root),
-            normalized_instrument,
-            requested_date,
-            normalized_hour,
-        )
+        if normalized_format == "csv":
+            published_path = write_ticks_csv(
+                ticks,
+                Path(output_root),
+                normalized_instrument,
+                requested_date,
+                normalized_hour,
+            )
+        else:
+            published_path = write_ticks_parquet(
+                ticks,
+                Path(output_root),
+                normalized_instrument,
+                requested_date,
+                normalized_hour,
+            )
         if raw_was_downloaded:
             _write_raw_json(raw_bytes, json_destination)
     except Exception:
@@ -538,11 +642,12 @@ def run_tick_hour(
         requested_date=requested_date,
         hour=normalized_hour,
         json_path=json_destination,
-        parquet_path=published_path,
+        output_path=published_path,
         tick_count=len(ticks),
         raw_was_downloaded=raw_was_downloaded,
         parquet_created=True,
         parquet_skipped=False,
+        output_format=normalized_format,
     )
 
 
@@ -553,6 +658,7 @@ def run_tick_date(
     *,
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
+    output_format: str = "parquet",
 ) -> TickDateResult:
     """Process requested hours independently and retain hour failures."""
 
@@ -569,6 +675,7 @@ def run_tick_date(
                 hour,
                 output_root=output_root,
                 fetcher=fetcher,
+                output_format=output_format,
             )
         except Exception as exc:
             outcomes.append(TickHourOutcome(requested_date, hour, None, str(exc)))

@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import tempfile
@@ -20,6 +21,7 @@ from dukascopy_market_data.ticks import (
     resolve_hours,
     run_tick_date,
     run_tick_hour,
+    tick_csv_path,
     tick_json_path,
     tick_parquet_path,
     validate_hour,
@@ -89,7 +91,6 @@ class DukascopyTickTests(unittest.TestCase):
             self.assertEqual(
                 tick_json_path(root, "EUR-USD", REQUESTED_DATE, 1),
                 root
-                / "artifacts"
                 / "instrument=EUR-USD"
                 / "json"
                 / "ticks"
@@ -101,7 +102,6 @@ class DukascopyTickTests(unittest.TestCase):
             self.assertEqual(
                 tick_parquet_path(root, "EUR-USD", REQUESTED_DATE, 1),
                 root
-                / "artifacts"
                 / "instrument=EUR-USD"
                 / "tf=1tick"
                 / "year=2026"
@@ -190,6 +190,67 @@ class DukascopyTickTests(unittest.TestCase):
             self.assertEqual(str(table.schema.field("timestamp").type), "timestamp[ms, tz=UTC]")
             self.assertEqual(str(table.schema.field("bidPrice").type), "double")
             self.assertEqual(str(table.schema.field("bidVolume").type), "int64")
+
+    def test_tick_csv_output_has_exact_schema_and_iso_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            result = run_tick_hour(
+                "EUR-USD",
+                REQUESTED_DATE,
+                1,
+                output_root=root,
+                fetcher=lambda url: tick_bytes(REQUESTED_DATE, int(url.rsplit("/", 1)[1])),
+                output_format="csv",
+            )
+
+            self.assertTrue(result.csv_path is not None)
+            output_path = tick_csv_path(root, "EUR-USD", REQUESTED_DATE, 1)
+            self.assertEqual(result.csv_path, output_path)
+            with output_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+            self.assertEqual(
+                rows[0],
+                ["timestamp", "bidPrice", "askPrice", "bidVolume", "askVolume"],
+            )
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(rows[1][0], "2026-09-01T01:00:00.010Z")
+            self.assertEqual(rows[1][3:], ["1000000", "1500000"])
+
+    def test_tick_csv_reuses_cache_and_does_not_collide_with_parquet(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            parquet_result = run_tick_hour(
+                "EUR-USD",
+                REQUESTED_DATE,
+                1,
+                output_root=root,
+                fetcher=lambda _: tick_bytes(),
+            )
+            raw_before = parquet_result.json_path.read_bytes()
+
+            csv_result = run_tick_hour(
+                "EUR-USD",
+                REQUESTED_DATE,
+                1,
+                output_root=root,
+                fetcher=lambda _: self.fail("CSV tick output must reuse cached JSON"),
+                output_format="csv",
+            )
+            self.assertTrue(csv_result.csv_path is not None)
+            self.assertTrue(csv_result.csv_path.exists())
+            self.assertTrue(parquet_result.parquet_path.exists())
+            self.assertEqual(csv_result.json_path.read_bytes(), raw_before)
+
+            skipped = run_tick_hour(
+                "EUR-USD",
+                REQUESTED_DATE,
+                1,
+                output_root=root,
+                fetcher=lambda _: self.fail("existing CSV tick output must be skipped"),
+                output_format="csv",
+            )
+            self.assertTrue(skipped.parquet_skipped)
+            self.assertIsNone(skipped.parquet_path)
 
     def test_tick_cache_reuse_empty_hours_and_existing_parquet_skip(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -289,6 +350,22 @@ class DukascopyTickTests(unittest.TestCase):
         )
         self.assertTrue(only_ticks.only_ticks)
         self.assertIsNone(only_ticks.aggregation)
+        csv_arguments = parser.parse_args(
+            [
+                "download",
+                "--instrument",
+                "EUR-USD",
+                "--date",
+                "2026-09-01",
+                "--aggregation",
+                "1",
+                "--csv",
+                "-o",
+                "nested/output",
+            ]
+        )
+        self.assertTrue(csv_arguments.csv)
+        self.assertEqual(csv_arguments.output, "nested/output")
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -347,6 +424,7 @@ class DukascopyTickTests(unittest.TestCase):
                         "--aggregation",
                         "1",
                         "--include-ticks",
+                        "--csv",
                     ],
                     output_root=root,
                     fetcher=fetch,
@@ -355,6 +433,18 @@ class DukascopyTickTests(unittest.TestCase):
             self.assertEqual(sum("/ticks/" in url for url in calls), 24)
             self.assertFalse(any("/COMB/" in url for url in calls))
             self.assertIn("created_tick_hours=24", stdout.getvalue())
+            self.assertTrue(tick_csv_path(root, "EUR-USD", REQUESTED_DATE, 0).exists())
+            self.assertTrue(
+                (
+                    root
+                    / "instrument=EUR-USD"
+                    / "tf=1m"
+                    / "year=2026"
+                    / "month=09"
+                    / "day=13"
+                    / "EUR-USD-2026-09-01-COMB.csv"
+                ).exists()
+            )
 
     def test_cli_only_ticks_single_hour_and_failure_summary_are_path_free(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -1,5 +1,7 @@
+import csv
 import json
 import io
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -227,10 +229,10 @@ class DukascopyCandleTests(unittest.TestCase):
         )
         self.assertEqual(
             raw_json_path(Path("output"), "EUR-USD", REQUESTED_DATE, "BID").as_posix(),
-            "output/artifacts/instrument=EUR-USD/json/minute/year=2026/month=09/day=13/EUR-USD-2026-09-13-BID.json",
+            "output/instrument=EUR-USD/json/minute/year=2026/month=09/day=13/EUR-USD-2026-09-13-BID.json",
         )
 
-    def test_legacy_candles_files_are_not_reused_by_artifacts_layout(self) -> None:
+    def test_legacy_candles_files_are_not_reused_by_new_output_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             output_root = Path(temporary_directory)
             legacy_raw = (
@@ -265,8 +267,8 @@ class DukascopyCandleTests(unittest.TestCase):
             )
 
             self.assertEqual(len(calls), 1)
-            self.assertTrue(json_path.is_relative_to(output_root / "artifacts"))
-            self.assertTrue(parquet_paths[0].is_relative_to(output_root / "artifacts"))
+            self.assertTrue(json_path.is_relative_to(output_root))
+            self.assertTrue(parquet_paths[0].is_relative_to(output_root))
             self.assertEqual(minute_count, 5)
             self.assertEqual(legacy_raw.read_bytes(), b"legacy raw")
             self.assertEqual(legacy_parquet.read_bytes(), b"legacy parquet")
@@ -437,7 +439,7 @@ class DukascopyCandleTests(unittest.TestCase):
             self.assertEqual(table.num_rows, 2)
 
             dataset = ds.dataset(
-                output_root / "artifacts" / "instrument=EUR-USD" / "tf=15m",
+                output_root / "instrument=EUR-USD" / "tf=15m",
                 format="parquet",
                 partitioning="hive",
             )
@@ -586,7 +588,6 @@ class DukascopyCandleTests(unittest.TestCase):
             self.assertTrue(
                 (
                     output_root
-                    / "artifacts"
                     / "instrument=EUR-USD"
                     / "tf=15m"
                     / "year=2026"
@@ -685,7 +686,6 @@ class DukascopyCandleTests(unittest.TestCase):
             for requested_date in (first_date, second_date):
                 parquet_path = (
                     output_root
-                    / "artifacts"
                     / "instrument=EUR-USD"
                     / "tf=15m"
                     / "year=2026"
@@ -831,7 +831,6 @@ class DukascopyCandleTests(unittest.TestCase):
             self.assertTrue(
                 (
                     output_root
-                    / "artifacts"
                     / "instrument=EUR-USD"
                     / "tf=15m"
                     / "year=2026"
@@ -999,6 +998,179 @@ class DukascopyCandleTests(unittest.TestCase):
             self.assertEqual(minute_count, 5)
             self.assertTrue(json_path.exists())
             self.assertEqual(output_path.read_bytes(), b"existing parquet")
+
+    def test_csv_output_has_iso_timestamp_and_shared_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            first = run_downloads(
+                "EUR-USD",
+                "BID",
+                REQUESTED_DATE,
+                15,
+                output_root=output_root,
+                fetcher=lambda _: sample_bytes(),
+                output_format="parquet",
+            )
+            raw_before = first.json_path.read_bytes()
+
+            second = run_downloads(
+                "EUR-USD",
+                "BID",
+                REQUESTED_DATE,
+                15,
+                output_root=output_root,
+                fetcher=lambda _: self.fail("CSV output must reuse cached JSON"),
+                output_format="csv",
+            )
+
+            self.assertEqual(len(first.parquet_paths), 1)
+            self.assertEqual(len(second.csv_paths), 1)
+            self.assertTrue(first.parquet_paths[0].exists())
+            self.assertTrue(second.csv_paths[0].exists())
+            self.assertEqual(first.json_path.read_bytes(), raw_before)
+            self.assertNotEqual(first.parquet_paths[0].suffix, second.csv_paths[0].suffix)
+
+            with second.csv_paths[0].open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+            self.assertEqual(
+                rows[0],
+                ["timestamp", "open", "high", "low", "close", "volume"],
+            )
+            self.assertEqual(rows[1][0], "2026-09-13T00:00:00.000Z")
+            self.assertEqual(len(rows), 3)
+
+            third = run_downloads(
+                "EUR-USD",
+                "BID",
+                REQUESTED_DATE,
+                15,
+                output_root=output_root,
+                fetcher=lambda _: self.fail("existing CSV output must be skipped"),
+                output_format="csv",
+            )
+            self.assertEqual(third.csv_paths, ())
+            self.assertEqual(third.skipped_aggregations, (15,))
+
+    def test_csv_combined_output_schema_and_default_output_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            previous_directory = Path.cwd()
+            os.chdir(root)
+            try:
+                def fetch(url: str) -> bytes:
+                    if "/BID/" in url:
+                        return sample_bytes()
+                    if "/ASK/" in url:
+                        return ask_bytes()
+                    self.fail(f"unexpected URL: {url}")
+
+                exit_code = main(
+                    [
+                        "download",
+                        "--instrument",
+                        "EUR-USD",
+                        "--date",
+                        "2026-09-13",
+                        "--aggregation",
+                        "15",
+                        "--csv",
+                    ],
+                    fetcher=fetch,
+                )
+            finally:
+                os.chdir(previous_directory)
+
+            output_path = (
+                root
+                / "output"
+                / "instrument=EUR-USD"
+                / "tf=15m"
+                / "year=2026"
+                / "month=09"
+                / "day=13"
+                / "EUR-USD-2026-09-13-COMB.csv"
+            )
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(output_path.exists())
+            self.assertFalse((root / "artifacts").exists())
+            with output_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+            self.assertEqual(
+                rows[0],
+                [
+                    "timestamp",
+                    "bidOpen",
+                    "bidHigh",
+                    "bidLow",
+                    "bidClose",
+                    "askOpen",
+                    "askHigh",
+                    "askLow",
+                    "askClose",
+                    "bidVolume",
+                    "askVolume",
+                ],
+            )
+
+    def test_relative_output_path_creates_nested_parents_and_rejects_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            previous_directory = Path.cwd()
+            os.chdir(root)
+            try:
+                exit_code = main(
+                    [
+                        "download",
+                        "--instrument",
+                        "EUR-USD",
+                        "--side",
+                        "BID",
+                        "--date",
+                        "2026-09-13",
+                        "--aggregation",
+                        "15",
+                        "--csv",
+                        "--output",
+                        "nested/data",
+                    ],
+                    fetcher=lambda _: sample_bytes(),
+                )
+            finally:
+                os.chdir(previous_directory)
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(
+                (
+                    root
+                    / "nested"
+                    / "data"
+                    / "instrument=EUR-USD"
+                    / "tf=15m"
+                ).exists()
+            )
+
+            output_file = root / "not-a-directory"
+            output_file.write_text("occupied", encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                failed = main(
+                    [
+                        "download",
+                        "--instrument",
+                        "EUR-USD",
+                        "--side",
+                        "BID",
+                        "--date",
+                        "2026-09-13",
+                        "--aggregation",
+                        "15",
+                        "--output",
+                        str(output_file),
+                    ],
+                    fetcher=lambda _: self.fail("invalid output must fail before download"),
+                )
+            self.assertEqual(failed, 1)
+            self.assertIn("output location cannot be written", stderr.getvalue())
 
 
 if __name__ == "__main__":

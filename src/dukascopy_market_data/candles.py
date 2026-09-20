@@ -3,11 +3,12 @@
 The Dukascopy endpoint stores a sparse series as a base timestamp, cumulative
 time deltas, and cumulative price deltas.  This module expands that payload,
 aggregates the resulting candles on UTC calendar boundaries, and writes a
-Hive-partitioned Parquet dataset.
+Hive-partitioned Parquet or CSV datasets.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -34,6 +35,7 @@ RETRY_DELAYS_SECONDS = (1.0, 2.0)
 MILLISECONDS_PER_MINUTE = 60_000
 MILLION = Decimal("1000000")
 INT64_MAX = 2**63 - 1
+OUTPUT_FORMATS = frozenset({"parquet", "csv"})
 INSTRUMENT_PATTERN = re.compile(
     r"^[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*$"
 )
@@ -94,11 +96,24 @@ class DownloadBatchResult:
     """Result of processing one or more requested aggregations."""
 
     json_path: Path
-    parquet_paths: tuple[Path, ...]
+    output_paths: tuple[Path, ...]
     minute_count: int
     raw_was_downloaded: bool
     created_aggregations: tuple[int, ...]
     skipped_aggregations: tuple[int, ...]
+    output_format: str = "parquet"
+
+    @property
+    def parquet_paths(self) -> tuple[Path, ...]:
+        """Backward-compatible Parquet path view."""
+
+        return self.output_paths if self.output_format == "parquet" else ()
+
+    @property
+    def csv_paths(self) -> tuple[Path, ...]:
+        """Return generated CSV paths for CSV batches."""
+
+        return self.output_paths if self.output_format == "csv" else ()
 
     @property
     def source_message(self) -> str:
@@ -110,12 +125,25 @@ class CombinedDownloadBatchResult:
     """Result of processing aligned BID and ASK data."""
 
     json_paths: tuple[Path, Path]
-    parquet_paths: tuple[Path, ...]
+    output_paths: tuple[Path, ...]
     minute_count: int
     raw_downloaded_sides: tuple[str, ...]
     raw_cached_sides: tuple[str, ...]
     created_aggregations: tuple[int, ...]
     skipped_aggregations: tuple[int, ...]
+    output_format: str = "parquet"
+
+    @property
+    def parquet_paths(self) -> tuple[Path, ...]:
+        """Backward-compatible Parquet path view."""
+
+        return self.output_paths if self.output_format == "parquet" else ()
+
+    @property
+    def csv_paths(self) -> tuple[Path, ...]:
+        """Return generated CSV paths for CSV batches."""
+
+        return self.output_paths if self.output_format == "csv" else ()
 
     @property
     def raw_was_downloaded(self) -> bool:
@@ -174,6 +202,29 @@ def validate_download_side(value: str) -> str:
     if side not in {"BID", "ASK", "COMB"}:
         raise ValueError(f"side must be BID, ASK, or COMB; received {value!r}")
     return side
+
+
+def validate_output_format(value: str) -> str:
+    """Validate the derived-data serialization format."""
+
+    if not isinstance(value, str):
+        raise ValueError(f"output format must be parquet or csv; received {value!r}")
+    output_format = value.strip().lower()
+    if output_format not in OUTPUT_FORMATS:
+        raise ValueError(
+            f"output format must be parquet or csv; received {value!r}"
+        )
+    return output_format
+
+
+def format_timestamp_utc(timestamp_ms: int) -> str:
+    """Serialize an epoch-millisecond timestamp as ISO-8601 UTC."""
+
+    seconds, milliseconds = divmod(timestamp_ms, 1000)
+    timestamp = datetime.fromtimestamp(seconds, tz=timezone.utc).replace(
+        microsecond=milliseconds * 1000
+    )
+    return timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def parse_date(value: str) -> date:
@@ -555,7 +606,6 @@ def raw_json_path(output_root: Path, instrument: str, requested_date: date, side
 
     return (
         output_root
-        / "artifacts"
         / f"instrument={instrument}"
         / "json"
         / "minute"
@@ -570,6 +620,35 @@ def _partition_date(timestamp_ms: int) -> date:
     return datetime.fromtimestamp(timestamp_ms // 1000, tz=timezone.utc).date()
 
 
+def candle_output_paths(
+    candles: Sequence[AggregatedCandle],
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    side: str,
+    aggregation_minutes: int,
+    output_format: str = "parquet",
+) -> dict[Path, list[AggregatedCandle]]:
+    """Group candle rows by UTC Hive partition and return final paths."""
+
+    normalized_format = validate_output_format(output_format)
+    partitions: dict[Path, list[AggregatedCandle]] = defaultdict(list)
+    extension = ".csv" if normalized_format == "csv" else ".parquet"
+    filename = f"{instrument}-{requested_date.isoformat()}-{side}{extension}"
+    for candle in candles:
+        partition_date = _partition_date(candle.timestamp_ms)
+        partition_dir = (
+            output_root
+            / f"instrument={instrument}"
+            / f"tf={aggregation_minutes}m"
+            / f"year={partition_date.year:04d}"
+            / f"month={partition_date.month:02d}"
+            / f"day={partition_date.day:02d}"
+        )
+        partitions[partition_dir / filename].append(candle)
+    return dict(sorted(partitions.items(), key=lambda item: str(item[0])))
+
+
 def parquet_output_paths(
     candles: Sequence[AggregatedCandle],
     output_root: Path,
@@ -578,15 +657,58 @@ def parquet_output_paths(
     side: str,
     aggregation_minutes: int,
 ) -> dict[Path, list[AggregatedCandle]]:
-    """Group output rows by their UTC Hive partition and return final paths."""
+    """Return Parquet candle paths for backward-compatible callers."""
 
-    partitions: dict[Path, list[AggregatedCandle]] = defaultdict(list)
-    filename = f"{instrument}-{requested_date.isoformat()}-{side}.parquet"
+    return candle_output_paths(
+        candles,
+        output_root,
+        instrument,
+        requested_date,
+        side,
+        aggregation_minutes,
+        "parquet",
+    )
+
+
+def csv_output_paths(
+    candles: Sequence[AggregatedCandle],
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    side: str,
+    aggregation_minutes: int,
+) -> dict[Path, list[AggregatedCandle]]:
+    """Return CSV candle paths grouped by UTC Hive partition."""
+
+    return candle_output_paths(
+        candles,
+        output_root,
+        instrument,
+        requested_date,
+        side,
+        aggregation_minutes,
+        "csv",
+    )
+
+
+def combined_candle_output_paths(
+    candles: Sequence[CombinedAggregatedCandle],
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    aggregation_minutes: int,
+    output_format: str = "parquet",
+) -> dict[Path, list[CombinedAggregatedCandle]]:
+    """Return combined paths grouped by their UTC Hive partition."""
+
+    normalized_format = validate_output_format(output_format)
+    partitions: dict[Path, list[CombinedAggregatedCandle]] = defaultdict(list)
+    extension = ".csv" if normalized_format == "csv" else ".parquet"
+    filename = f"{instrument}-{requested_date.isoformat()}-COMB{extension}"
     for candle in candles:
         partition_date = _partition_date(candle.timestamp_ms)
         partition_dir = (
             output_root
-            / "artifacts"
             / f"instrument={instrument}"
             / f"tf={aggregation_minutes}m"
             / f"year={partition_date.year:04d}"
@@ -604,23 +726,35 @@ def combined_parquet_output_paths(
     requested_date: date,
     aggregation_minutes: int,
 ) -> dict[Path, list[CombinedAggregatedCandle]]:
-    """Return combined output paths grouped by their UTC Hive partition."""
+    """Return combined Parquet paths for backward-compatible callers."""
 
-    partitions: dict[Path, list[CombinedAggregatedCandle]] = defaultdict(list)
-    filename = f"{instrument}-{requested_date.isoformat()}-COMB.parquet"
-    for candle in candles:
-        partition_date = _partition_date(candle.timestamp_ms)
-        partition_dir = (
-            output_root
-            / "artifacts"
-            / f"instrument={instrument}"
-            / f"tf={aggregation_minutes}m"
-            / f"year={partition_date.year:04d}"
-            / f"month={partition_date.month:02d}"
-            / f"day={partition_date.day:02d}"
-        )
-        partitions[partition_dir / filename].append(candle)
-    return dict(sorted(partitions.items(), key=lambda item: str(item[0])))
+    return combined_candle_output_paths(
+        candles,
+        output_root,
+        instrument,
+        requested_date,
+        aggregation_minutes,
+        "parquet",
+    )
+
+
+def combined_csv_output_paths(
+    candles: Sequence[CombinedAggregatedCandle],
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    aggregation_minutes: int,
+) -> dict[Path, list[CombinedAggregatedCandle]]:
+    """Return combined CSV paths grouped by UTC Hive partition."""
+
+    return combined_candle_output_paths(
+        candles,
+        output_root,
+        instrument,
+        requested_date,
+        aggregation_minutes,
+        "csv",
+    )
 
 
 def _utc_timestamp_array(candles: Sequence[AggregatedCandle]) -> pa.Array:
@@ -692,6 +826,54 @@ def _table_for_combined_candles(
     return table.replace_schema_metadata(metadata)
 
 
+def _write_csv_partitions(
+    paths_to_rows: Mapping[Path, Sequence[Any]],
+    headers: Sequence[str],
+    row_builder: Callable[[Any], Sequence[Any]],
+    *,
+    kind: str,
+) -> list[Path]:
+    """Write partitioned CSV files atomically without overwriting."""
+
+    final_paths = list(paths_to_rows)
+    existing = next((path for path in final_paths if path.exists()), None)
+    if existing is not None:
+        raise FileExistsError(f"refusing to overwrite existing CSV file: {existing}")
+
+    published_paths: list[Path] = []
+    temporary_paths: list[Path] = []
+    try:
+        for final_path, partition_rows in paths_to_rows.items():
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary_name = tempfile.mkstemp(
+                prefix=f".{kind}-csv-",
+                suffix=".tmp",
+                dir=final_path.parent,
+            )
+            os.close(fd)
+            temporary_path = Path(temporary_name)
+            temporary_paths.append(temporary_path)
+            with temporary_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle, lineterminator="\n")
+                writer.writerow(headers)
+                for row in partition_rows:
+                    writer.writerow(row_builder(row))
+
+        for temporary_path, final_path in zip(temporary_paths, final_paths):
+            if final_path.exists():
+                raise FileExistsError(f"refusing to overwrite existing CSV file: {final_path}")
+            os.replace(temporary_path, final_path)
+            published_paths.append(final_path)
+        temporary_paths.clear()
+        return final_paths
+    except Exception:
+        for temporary_path in temporary_paths:
+            temporary_path.unlink(missing_ok=True)
+        for published_path in published_paths:
+            published_path.unlink(missing_ok=True)
+        raise
+
+
 def write_parquet(
     candles: Sequence[AggregatedCandle],
     output_root: Path,
@@ -757,6 +939,44 @@ def write_parquet(
         raise
 
 
+def write_csv(
+    candles: Sequence[AggregatedCandle],
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    side: str,
+    aggregation_minutes: int | str,
+) -> list[Path]:
+    """Write aggregated candles into non-overwriting Hive-partitioned CSV files."""
+
+    if not candles:
+        raise ValueError("cannot write an empty candle sequence")
+    normalized_instrument = validate_instrument(instrument)
+    normalized_side = validate_side(side)
+    normalized_aggregation = validate_aggregation(aggregation_minutes)
+    paths_to_rows = csv_output_paths(
+        candles,
+        Path(output_root),
+        normalized_instrument,
+        requested_date,
+        normalized_side,
+        normalized_aggregation,
+    )
+    return _write_csv_partitions(
+        paths_to_rows,
+        ("timestamp", "open", "high", "low", "close", "volume"),
+        lambda candle: (
+            format_timestamp_utc(candle.timestamp_ms),
+            str(candle.open),
+            str(candle.high),
+            str(candle.low),
+            str(candle.close),
+            str(candle.volume),
+        ),
+        kind="candle",
+    )
+
+
 def write_combined_parquet(
     candles: Sequence[CombinedAggregatedCandle],
     output_root: Path,
@@ -816,6 +1036,58 @@ def write_combined_parquet(
         for published_path in published_paths:
             published_path.unlink(missing_ok=True)
         raise
+
+
+def write_combined_csv(
+    candles: Sequence[CombinedAggregatedCandle],
+    output_root: Path,
+    instrument: str,
+    requested_date: date,
+    aggregation_minutes: int | str,
+) -> list[Path]:
+    """Write combined BID/ASK candles into non-overwriting CSV files."""
+
+    if not candles:
+        raise ValueError("cannot write an empty candle sequence")
+    normalized_instrument = validate_instrument(instrument)
+    normalized_aggregation = validate_aggregation(aggregation_minutes)
+    paths_to_rows = combined_csv_output_paths(
+        candles,
+        Path(output_root),
+        normalized_instrument,
+        requested_date,
+        normalized_aggregation,
+    )
+    return _write_csv_partitions(
+        paths_to_rows,
+        (
+            "timestamp",
+            "bidOpen",
+            "bidHigh",
+            "bidLow",
+            "bidClose",
+            "askOpen",
+            "askHigh",
+            "askLow",
+            "askClose",
+            "bidVolume",
+            "askVolume",
+        ),
+        lambda candle: (
+            format_timestamp_utc(candle.timestamp_ms),
+            str(candle.bid_open),
+            str(candle.bid_high),
+            str(candle.bid_low),
+            str(candle.bid_close),
+            str(candle.ask_open),
+            str(candle.ask_high),
+            str(candle.ask_low),
+            str(candle.ask_close),
+            str(candle.bid_volume),
+            str(candle.ask_volume),
+        ),
+        kind="combined-candle",
+    )
 
 
 def _write_raw_json(raw_bytes: bytes, destination: Path) -> None:
@@ -915,12 +1187,14 @@ def run_downloads(
     *,
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
+    output_format: str = "parquet",
 ) -> DownloadBatchResult | CombinedDownloadBatchResult:
     """Reuse or download raw data, then publish requested aggregations."""
 
     normalized_instrument = validate_instrument(instrument)
     normalized_side = validate_download_side(side)
     normalized_aggregations = validate_aggregations(aggregation_minutes)
+    normalized_format = validate_output_format(output_format)
     normalized_root = Path(output_root)
     if normalized_side == "COMB":
         return run_combined_downloads(
@@ -929,6 +1203,7 @@ def run_downloads(
             normalized_aggregations,
             output_root=normalized_root,
             fetcher=fetcher,
+            output_format=normalized_format,
         )
 
     raw_bytes, json_destination, raw_was_downloaded = _load_or_download_raw(
@@ -945,55 +1220,70 @@ def run_downloads(
             _write_raw_json(raw_bytes, json_destination)
         return DownloadBatchResult(
             json_path=json_destination,
-            parquet_paths=(),
+            output_paths=(),
             minute_count=0,
             raw_was_downloaded=raw_was_downloaded,
             created_aggregations=(),
             skipped_aggregations=(),
+            output_format=normalized_format,
         )
 
-    published_parquet: list[Path] = []
+    published_outputs: list[Path] = []
     created_aggregations: list[int] = []
     skipped_aggregations: list[int] = []
     try:
         for aggregation in normalized_aggregations:
             aggregated_candles = aggregate_candles(minute_candles, aggregation)
-            output_paths = parquet_output_paths(
+            output_paths = candle_output_paths(
                 aggregated_candles,
                 normalized_root,
                 normalized_instrument,
                 requested_date,
                 normalized_side,
                 aggregation,
+                normalized_format,
             )
             if any(path.exists() for path in output_paths):
                 skipped_aggregations.append(aggregation)
                 continue
 
-            published_parquet.extend(
-                write_parquet(
-                    aggregated_candles,
-                    normalized_root,
-                    normalized_instrument,
-                    requested_date,
-                    normalized_side,
-                    aggregation,
+            if normalized_format == "csv":
+                published_outputs.extend(
+                    write_csv(
+                        aggregated_candles,
+                        normalized_root,
+                        normalized_instrument,
+                        requested_date,
+                        normalized_side,
+                        aggregation,
+                    )
                 )
-            )
+            else:
+                published_outputs.extend(
+                    write_parquet(
+                        aggregated_candles,
+                        normalized_root,
+                        normalized_instrument,
+                        requested_date,
+                        normalized_side,
+                        aggregation,
+                    )
+                )
             created_aggregations.append(aggregation)
         if raw_was_downloaded:
             _write_raw_json(raw_bytes, json_destination)
     except Exception:
-        for path in published_parquet:
+        for path in published_outputs:
             path.unlink(missing_ok=True)
         raise
     return DownloadBatchResult(
         json_path=json_destination,
-        parquet_paths=tuple(published_parquet),
+        output_paths=tuple(published_outputs),
         minute_count=len(minute_candles),
         raw_was_downloaded=raw_was_downloaded,
         created_aggregations=tuple(created_aggregations),
         skipped_aggregations=tuple(skipped_aggregations),
+        output_format=normalized_format,
     )
 
 
@@ -1004,11 +1294,13 @@ def run_combined_downloads(
     *,
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
+    output_format: str = "parquet",
 ) -> CombinedDownloadBatchResult:
     """Reuse or download both sides, then publish combined aggregations."""
 
     normalized_instrument = validate_instrument(instrument)
     normalized_aggregations = validate_aggregations(aggregation_minutes)
+    normalized_format = validate_output_format(output_format)
     normalized_root = Path(output_root)
 
     raw_by_side: dict[str, tuple[bytes, Path, bool]] = {}
@@ -1050,15 +1342,16 @@ def run_combined_downloads(
                 _write_raw_json(raw_bytes, destination)
         return CombinedDownloadBatchResult(
             json_paths=(bid_json_path, ask_json_path),
-            parquet_paths=(),
+            output_paths=(),
             minute_count=0,
             raw_downloaded_sides=raw_downloaded_sides,
             raw_cached_sides=raw_cached_sides,
             created_aggregations=(),
             skipped_aggregations=(),
+            output_format=normalized_format,
         )
 
-    published_parquet: list[Path] = []
+    published_outputs: list[Path] = []
     created_aggregations: list[int] = []
     skipped_aggregations: list[int] = []
     written_raw_paths: list[Path] = []
@@ -1069,26 +1362,38 @@ def run_combined_downloads(
                 ask_candles,
                 aggregation,
             )
-            output_paths = combined_parquet_output_paths(
+            output_paths = combined_candle_output_paths(
                 aggregated_candles,
                 normalized_root,
                 normalized_instrument,
                 requested_date,
                 aggregation,
+                normalized_format,
             )
             if any(path.exists() for path in output_paths):
                 skipped_aggregations.append(aggregation)
                 continue
 
-            published_parquet.extend(
-                write_combined_parquet(
-                    aggregated_candles,
-                    normalized_root,
-                    normalized_instrument,
-                    requested_date,
-                    aggregation,
+            if normalized_format == "csv":
+                published_outputs.extend(
+                    write_combined_csv(
+                        aggregated_candles,
+                        normalized_root,
+                        normalized_instrument,
+                        requested_date,
+                        aggregation,
+                    )
                 )
-            )
+            else:
+                published_outputs.extend(
+                    write_combined_parquet(
+                        aggregated_candles,
+                        normalized_root,
+                        normalized_instrument,
+                        requested_date,
+                        aggregation,
+                    )
+                )
             created_aggregations.append(aggregation)
 
         for raw_bytes, destination, was_downloaded in raw_by_side.values():
@@ -1096,7 +1401,7 @@ def run_combined_downloads(
                 _write_raw_json(raw_bytes, destination)
                 written_raw_paths.append(destination)
     except Exception:
-        for path in published_parquet:
+        for path in published_outputs:
             path.unlink(missing_ok=True)
         for path in written_raw_paths:
             path.unlink(missing_ok=True)
@@ -1104,12 +1409,13 @@ def run_combined_downloads(
 
     return CombinedDownloadBatchResult(
         json_paths=(bid_json_path, ask_json_path),
-        parquet_paths=tuple(published_parquet),
+        output_paths=tuple(published_outputs),
         minute_count=len(bid_candles),
         raw_downloaded_sides=raw_downloaded_sides,
         raw_cached_sides=raw_cached_sides,
         created_aggregations=tuple(created_aggregations),
         skipped_aggregations=tuple(skipped_aggregations),
+        output_format=normalized_format,
     )
 
 
@@ -1121,6 +1427,7 @@ def run_download(
     *,
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
+    output_format: str = "parquet",
 ) -> tuple[Path, list[Path], int]:
     """Process one aggregation while preserving the original return shape."""
 
@@ -1132,8 +1439,9 @@ def run_download(
         (aggregation_minutes,),
         output_root=output_root,
         fetcher=fetcher,
+        output_format=output_format,
     )
-    return result.json_path, list(result.parquet_paths), result.minute_count
+    return result.json_path, list(result.output_paths), result.minute_count
 
 
 def run_date_range(
@@ -1144,6 +1452,7 @@ def run_date_range(
     *,
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
+    output_format: str = "parquet",
 ) -> tuple[DateRunOutcome, ...]:
     """Process dates independently and retain failures for the final summary."""
 
@@ -1161,6 +1470,7 @@ def run_date_range(
                 aggregation_minutes,
                 output_root=output_root,
                 fetcher=fetcher,
+                output_format=output_format,
             )
         except Exception as exc:
             outcomes.append(DateRunOutcome(requested_date, None, str(exc)))
