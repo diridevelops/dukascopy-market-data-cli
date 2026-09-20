@@ -1,6 +1,16 @@
 # Dukascopy market-data downloader CLI
 
-A command-line tool for downloading historical market data from the [Dukascopy](https://www.dukascopy.com) public endpoint.
+A command-line tool for downloading historical market data for
+
+- Forex
+- Commodities CFD
+- Indices CFD
+- Bonds CFD
+- Stocks CFD
+- ETF CFD
+- Crypto CFD
+
+Data is downloaded from the [Dukascopy](https://www.dukascopy.com) public endpoint.
 
 It offers functionality similar to Dukascopy's [Historical Data Export](https://www.dukascopy.com/swiss/english/marketwatch/historical/) webpage, with additional support for conveniently downloading arbitrary date ranges and integrating data retrieval into scripts and automated workflows.
 
@@ -27,6 +37,28 @@ The CLI provides two commands:
 ├── tests/
 └── output/
 ```
+
+## Installation
+
+Install the project as a `uv` tool from the project root. This
+installs the dependencies and exposes the `dukascopy` command:
+
+```bash
+uv tool install .
+dukascopy --help
+dukascopy instruments
+```
+
+If your shell cannot find the command after installation, add uv's tool bin
+directory to your `PATH` with:
+
+```bash
+uv tool update-shell
+```
+
+Then restart the shell and run `dukascopy` directly. For project-local
+execution without installing a global command, use `uv run dukascopy` or
+`uv run --active dukascopy` as described below.
 
 Run commands from the root directory:
 
