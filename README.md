@@ -87,6 +87,10 @@ uv run dukascopy --help
 
 ## List instrument codes
 
+For a reference list of available instruments and the earliest available data
+for each instrument, see the [Dukascopy Node instruments
+page](https://www.dukascopy-node.app/instruments).
+
 Fetch the live instrument catalogue and print only sorted, unique codes:
 
 ```bash
