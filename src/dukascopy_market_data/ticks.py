@@ -57,6 +57,7 @@ class TickHourResult:
     parquet_created: bool
     parquet_skipped: bool
     output_format: str = "parquet"
+    cache_enabled: bool = True
 
     @property
     def parquet_path(self) -> Path | None:
@@ -76,6 +77,8 @@ class TickHourResult:
 
     @property
     def source_message(self) -> str:
+        if not self.cache_enabled:
+            return "Downloaded without caching"
         return "Downloaded" if self.raw_was_downloaded else "Reused cached JSON"
 
 
@@ -541,10 +544,11 @@ def _load_or_download_tick_raw(
     *,
     output_root: Path,
     fetcher: Callable[[str], bytes],
+    use_cache: bool = True,
 ) -> tuple[bytes, Path, bool]:
     normalized_instrument = validate_instrument(instrument)
     destination = tick_json_path(output_root, normalized_instrument, requested_date, hour)
-    if destination.exists():
+    if use_cache and destination.exists():
         return destination.read_bytes(), destination, False
     return (
         fetcher(build_tick_endpoint_url(normalized_instrument, requested_date, hour)),
@@ -561,6 +565,7 @@ def run_tick_hour(
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
     output_format: str = "parquet",
+    no_cache: bool = False,
 ) -> TickHourResult:
     """Reuse or download, validate, and publish one tick hour."""
 
@@ -573,6 +578,7 @@ def run_tick_hour(
         normalized_hour,
         output_root=Path(output_root),
         fetcher=fetcher,
+        use_cache=not no_cache,
     )
     ticks = decode_tick_json_bytes(
         raw_bytes,
@@ -584,7 +590,7 @@ def run_tick_hour(
     )
 
     if not ticks:
-        if raw_was_downloaded:
+        if raw_was_downloaded and not no_cache:
             _write_raw_json(raw_bytes, json_destination)
         return TickHourResult(
             requested_date=requested_date,
@@ -596,10 +602,11 @@ def run_tick_hour(
             parquet_created=False,
             parquet_skipped=False,
             output_format=normalized_format,
+            cache_enabled=not no_cache,
         )
 
     if output_path.exists():
-        if raw_was_downloaded:
+        if raw_was_downloaded and not no_cache:
             _write_raw_json(raw_bytes, json_destination)
         return TickHourResult(
             requested_date=requested_date,
@@ -611,6 +618,7 @@ def run_tick_hour(
             parquet_created=False,
             parquet_skipped=True,
             output_format=normalized_format,
+            cache_enabled=not no_cache,
         )
 
     published_path: Path | None = None
@@ -631,7 +639,7 @@ def run_tick_hour(
                 requested_date,
                 normalized_hour,
             )
-        if raw_was_downloaded:
+        if raw_was_downloaded and not no_cache:
             _write_raw_json(raw_bytes, json_destination)
     except Exception:
         if published_path is not None:
@@ -648,6 +656,7 @@ def run_tick_hour(
         parquet_created=True,
         parquet_skipped=False,
         output_format=normalized_format,
+        cache_enabled=not no_cache,
     )
 
 
@@ -659,6 +668,7 @@ def run_tick_date(
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
     output_format: str = "parquet",
+    no_cache: bool = False,
 ) -> TickDateResult:
     """Process requested hours independently and retain hour failures."""
 
@@ -676,6 +686,7 @@ def run_tick_date(
                 output_root=output_root,
                 fetcher=fetcher,
                 output_format=output_format,
+                no_cache=no_cache,
             )
         except Exception as exc:
             outcomes.append(TickHourOutcome(requested_date, hour, None, str(exc)))

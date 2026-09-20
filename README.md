@@ -146,6 +146,7 @@ The download arguments are:
 | `--include-ticks` | Download candles and all 24 tick hours for every requested date. | flag |
 | `--hour` | Tick hour from `0` through `23`; valid only with `--only-ticks`. Without it, all hours are downloaded. | `1` |
 | `--csv` | Write derived candle and tick data as CSV instead of Parquet. Raw JSON caches are unchanged. | flag |
+| `--no-cache` | Ignore existing raw JSON and do not save downloaded JSON responses. Existing raw files remain unchanged. | flag |
 | `-o`, `--output` | Exact output root. Relative paths use the current working directory; missing parents are created. | `./data` |
 
 Use `--help` for the complete command syntax:
@@ -301,19 +302,41 @@ the BID and ASK JSON files are cached independently. If a new aggregation or
 tick output is requested for an existing raw JSON file, the file is validated
 locally and reused without another network request.
 
+Use `--no-cache` when the invocation must fetch fresh source responses:
+
+```bash
+uv run dukascopy download \
+  --instrument EUR-USD \
+  --date 2026-09-13 \
+  --aggregation 1,5,15 \
+  --no-cache
+```
+
+No-cache mode bypasses existing candle and tick JSON files, including invalid
+ones, and never saves the fresh response bytes. Existing raw JSON files are
+preserved byte-for-byte. The fresh responses are still validated and used to
+produce derived outputs in memory. This applies to single-side candles,
+`COMB`, tick-only downloads, `--include-ticks`, and date ranges.
+
 Existing target files in the selected format are skipped; missing outputs are
 created. Parquet and CSV targets are independent, so an existing Parquet file
 does not block a later CSV request and vice versa. Existing raw JSON and
-derived files are never overwritten. Refreshing source data requires
+derived files are never overwritten. In no-cache mode, existing derived files
+are still skipped and are not overwritten. Refreshing source data in normal
+mode requires
 deliberately removing the relevant raw JSON and derived outputs before
-rerunning. Invalid cached JSON is rejected rather than silently redownloaded.
+rerunning. Invalid cached JSON is rejected rather than silently redownloaded
+in normal mode; `--no-cache` does not read cached JSON and therefore ignores
+it.
 
 The current default layout is rooted at `output/`. Existing files under the
 legacy `candles/` or former `artifacts/` directories are left untouched and
 are not migrated or reused.
 
 Valid empty candle days and tick hours are cached without creating derived
-files. They are reported as empty work rather than failures.
+files in normal mode. In no-cache mode they are processed as empty work but
+neither the raw JSON nor derived files are created. Empty work is reported as
+successful rather than failed.
 
 ## Tests
 
@@ -329,7 +352,7 @@ To run the same suite with the active virtual environment:
 uv run --active python -m unittest discover -s ./tests -p 'test_*.py' -v
 ```
 
-The tests cover subcommand dispatch, no-subcommand help, instrument-code decoding and validation, exact dotted/mixed-case codes, candle and tick URL formation, compressed candle/tick decoding, empty days and hours, date ranges, cached-JSON reuse, BID/ASK/COMB modes, positional side matching, sparse aggregation, one-row-per-tick output, UTC Parquet schemas, ISO-8601 CSV output, configurable output roots, Hive partitions, failure continuation, format-specific collisions, and no-overwrite behavior.
+The tests cover subcommand dispatch, no-subcommand help, instrument-code decoding and validation, exact dotted/mixed-case codes, candle and tick URL formation, compressed candle/tick decoding, empty days and hours, date ranges, cached-JSON reuse, strict no-cache behavior, BID/ASK/COMB modes, positional side matching, sparse aggregation, one-row-per-tick output, UTC Parquet schemas, ISO-8601 CSV output, configurable output roots, Hive partitions, failure continuation, format-specific collisions, and no-overwrite behavior.
 
 ## Common errors
 
@@ -339,8 +362,8 @@ The tests cover subcommand dispatch, no-subcommand help, instrument-code decodin
 - **Invalid tick flags**: `--only-ticks` must omit `--aggregation`; `--include-ticks` requires `--aggregation`; `--hour` is valid only with `--only-ticks`.
 - **Existing output**: the requested aggregation or tick hour is skipped when the same format already exists; Parquet and CSV outputs are independent.
 - **Output location**: the default is `./output`; `--output` creates missing parents but returns an error if the location is a file or cannot be written.
-- **Invalid cached JSON**: the source cache is malformed or violates the endpoint contract; remove it deliberately before retrying a fresh download.
+- **Invalid cached JSON**: normal mode rejects malformed or contract-invalid cached data instead of redownloading it; use `--no-cache` to fetch fresh data without reading or replacing that cache.
 - **Empty date**: the endpoint returned a valid response with no candles; this is reported and creates no derived output.
-- **Empty tick hour**: the endpoint returned a valid empty hourly response; its JSON is cached and no tick derived file is created.
+- **Empty tick hour**: the endpoint returned a valid empty hourly response; its JSON is cached in normal mode, while `--no-cache` leaves no raw cache, and no tick derived file is created.
 - **Range failure**: the failed date is reported, other dates continue, and the process exits with status `1`.
 - **HTTP or connection error**: check network access. Transient connection failures and selected HTTP statuses are retried automatically.

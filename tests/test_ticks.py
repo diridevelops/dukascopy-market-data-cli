@@ -305,6 +305,84 @@ class DukascopyTickTests(unittest.TestCase):
                 )
             self.assertEqual(cached.read_bytes(), b"invalid")
 
+    def test_tick_no_cache_fetches_fresh_and_preserves_invalid_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            cached = tick_json_path(root, "EUR-USD", REQUESTED_DATE, 1)
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b"invalid cached tick response")
+            calls: list[str] = []
+
+            result = run_tick_hour(
+                "EUR-USD",
+                REQUESTED_DATE,
+                1,
+                output_root=root,
+                fetcher=lambda url: (calls.append(url) or tick_bytes()),
+                output_format="csv",
+                no_cache=True,
+            )
+
+            self.assertEqual(
+                calls,
+                [f"{TICKS_BASE_URL}/EUR-USD/2026/9/1/1"],
+            )
+            self.assertFalse(result.cache_enabled)
+            self.assertEqual(result.source_message, "Downloaded without caching")
+            self.assertEqual(cached.read_bytes(), b"invalid cached tick response")
+            self.assertTrue(result.csv_path is not None and result.csv_path.exists())
+
+    def test_tick_no_cache_does_not_save_new_or_empty_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            result = run_tick_hour(
+                "EUR-USD",
+                REQUESTED_DATE,
+                1,
+                output_root=root,
+                fetcher=lambda _: tick_bytes(),
+                output_format="csv",
+                no_cache=True,
+            )
+            self.assertTrue(result.csv_path is not None and result.csv_path.exists())
+            self.assertFalse(tick_json_path(root, "EUR-USD", REQUESTED_DATE, 1).exists())
+
+            empty = run_tick_hour(
+                "EUR-USD",
+                REQUESTED_DATE,
+                2,
+                output_root=root,
+                fetcher=lambda _: empty_tick_bytes(REQUESTED_DATE, 2),
+                no_cache=True,
+            )
+            self.assertTrue(empty.is_empty)
+            self.assertFalse(tick_json_path(root, "EUR-USD", REQUESTED_DATE, 2).exists())
+            self.assertFalse(tick_parquet_path(root, "EUR-USD", REQUESTED_DATE, 2).exists())
+
+    def test_tick_date_no_cache_fetches_each_requested_hour_without_caching(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            calls: list[str] = []
+
+            result = run_tick_date(
+                "EUR-USD",
+                REQUESTED_DATE,
+                (0, 1),
+                output_root=root,
+                fetcher=lambda url: (
+                    calls.append(url),
+                    tick_bytes(REQUESTED_DATE, int(url.rsplit("/", 1)[1])),
+                )[1],
+                output_format="csv",
+                no_cache=True,
+            )
+
+            self.assertEqual(len(result.successful_hours), 2)
+            self.assertEqual(len(calls), 2)
+            for hour in (0, 1):
+                self.assertFalse(tick_json_path(root, "EUR-USD", REQUESTED_DATE, hour).exists())
+                self.assertTrue(tick_csv_path(root, "EUR-USD", REQUESTED_DATE, hour).exists())
+
     def test_tick_date_processes_all_hours_and_continues_after_failure(self) -> None:
         first_date = REQUESTED_DATE
         second_date = date(2026, 9, 2)
@@ -366,6 +444,20 @@ class DukascopyTickTests(unittest.TestCase):
         )
         self.assertTrue(csv_arguments.csv)
         self.assertEqual(csv_arguments.output, "nested/output")
+        no_cache_arguments = parser.parse_args(
+            [
+                "download",
+                "--instrument",
+                "EUR-USD",
+                "--date",
+                "2026-09-01",
+                "--only-ticks",
+                "--hour",
+                "1",
+                "--no-cache",
+            ]
+        )
+        self.assertTrue(no_cache_arguments.no_cache)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -425,6 +517,7 @@ class DukascopyTickTests(unittest.TestCase):
                         "1",
                         "--include-ticks",
                         "--csv",
+                        "--no-cache",
                     ],
                     output_root=root,
                     fetcher=fetch,
@@ -433,6 +526,7 @@ class DukascopyTickTests(unittest.TestCase):
             self.assertEqual(sum("/ticks/" in url for url in calls), 24)
             self.assertFalse(any("/COMB/" in url for url in calls))
             self.assertIn("created_tick_hours=24", stdout.getvalue())
+            self.assertFalse(tick_json_path(root, "EUR-USD", REQUESTED_DATE, 0).exists())
             self.assertTrue(tick_csv_path(root, "EUR-USD", REQUESTED_DATE, 0).exists())
             self.assertTrue(
                 (

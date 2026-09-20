@@ -160,6 +160,19 @@ class DukascopyCandleTests(unittest.TestCase):
             ]
         )
         self.assertEqual(default_combined.side, "COMB")
+        no_cache_arguments = parser.parse_args(
+            [
+                "download",
+                "--instrument",
+                "EUR-USD",
+                "--date",
+                "2026-09-13",
+                "--aggregation",
+                "15",
+                "--no-cache",
+            ]
+        )
+        self.assertTrue(no_cache_arguments.no_cache)
         explicit_combined = parser.parse_args(
             [
                 "download",
@@ -842,6 +855,42 @@ class DukascopyCandleTests(unittest.TestCase):
             self.assertTrue(raw_json_path(output_root, "EUR-USD", empty_date, "BID").exists())
             self.assertFalse(raw_json_path(output_root, "EUR-USD", failed_date, "BID").exists())
 
+    def test_date_range_no_cache_keeps_derived_outputs_without_raw_json(self) -> None:
+        first_date = date(2026, 9, 11)
+        second_date = date(2026, 9, 12)
+
+        def fetch_by_date(url: str) -> bytes:
+            day = int(url.rsplit("/", 1)[1])
+            return sample_bytes(timestamp_for_day(date(2026, 9, day)))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            outcomes = run_date_range(
+                "EUR-USD",
+                "BID",
+                (first_date, second_date),
+                15,
+                output_root=output_root,
+                fetcher=fetch_by_date,
+                no_cache=True,
+            )
+
+            self.assertTrue(all(outcome.result is not None for outcome in outcomes))
+            for requested_date in (first_date, second_date):
+                self.assertFalse(
+                    raw_json_path(output_root, "EUR-USD", requested_date, "BID").exists()
+                )
+                self.assertTrue(
+                    (
+                        output_root
+                        / "instrument=EUR-USD"
+                        / "tf=15m"
+                        / f"year={requested_date.year:04d}"
+                        / f"month={requested_date.month:02d}"
+                        / f"day={requested_date.day:02d}"
+                    ).exists()
+                )
+
     def test_main_reports_empty_and_failed_dates_and_returns_nonzero(self) -> None:
         first_date = date(2026, 9, 11)
         empty_date = date(2026, 9, 12)
@@ -998,6 +1047,128 @@ class DukascopyCandleTests(unittest.TestCase):
             self.assertEqual(minute_count, 5)
             self.assertTrue(json_path.exists())
             self.assertEqual(output_path.read_bytes(), b"existing parquet")
+
+    def test_no_cache_fetches_fresh_ignores_invalid_cache_and_preserves_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            cached = raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "BID")
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b"invalid cached response")
+            calls: list[str] = []
+
+            result = run_downloads(
+                "EUR-USD",
+                "BID",
+                REQUESTED_DATE,
+                15,
+                output_root=output_root,
+                fetcher=lambda url: (calls.append(url) or sample_bytes()),
+                no_cache=True,
+            )
+
+            self.assertEqual(
+                calls,
+                ["https://jetta.dukascopy.com/v1/candles/minute/EUR-USD/BID/2026/9/13"],
+            )
+            self.assertFalse(result.cache_enabled)
+            self.assertTrue(result.raw_was_downloaded)
+            self.assertEqual(result.source_message, "Downloaded without caching")
+            self.assertEqual(cached.read_bytes(), b"invalid cached response")
+            self.assertEqual(len(result.parquet_paths), 1)
+
+    def test_no_cache_does_not_save_new_candle_json_or_empty_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            nonempty = run_downloads(
+                "EUR-USD",
+                "BID",
+                REQUESTED_DATE,
+                15,
+                output_root=output_root,
+                fetcher=lambda _: sample_bytes(),
+                no_cache=True,
+            )
+            nonempty_json = raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "BID")
+            self.assertFalse(nonempty_json.exists())
+            self.assertEqual(len(nonempty.parquet_paths), 1)
+
+            empty_date = date(2026, 9, 14)
+            empty = run_downloads(
+                "EUR-USD",
+                "BID",
+                empty_date,
+                15,
+                output_root=output_root,
+                fetcher=lambda _: empty_bytes(timestamp_for_day(empty_date)),
+                no_cache=True,
+            )
+            empty_json = raw_json_path(output_root, "EUR-USD", empty_date, "BID")
+            self.assertEqual(empty.minute_count, 0)
+            self.assertEqual(empty.parquet_paths, ())
+            self.assertFalse(empty_json.exists())
+
+    def test_no_cache_invalid_fresh_response_does_not_replace_existing_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            cached = raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "BID")
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(sample_bytes())
+
+            with self.assertRaises(DataValidationError):
+                run_downloads(
+                    "EUR-USD",
+                    "BID",
+                    REQUESTED_DATE,
+                    15,
+                    output_root=output_root,
+                    fetcher=lambda _: b"fresh but invalid",
+                    no_cache=True,
+                )
+            self.assertEqual(cached.read_bytes(), sample_bytes())
+
+    def test_no_cache_combined_fetches_both_sides_and_preserves_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            run_combined_downloads(
+                "EUR-USD",
+                REQUESTED_DATE,
+                15,
+                output_root=output_root,
+                fetcher=lambda url: ask_bytes() if "/ASK/" in url else sample_bytes(),
+            )
+            bid_path = raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "BID")
+            ask_path = raw_json_path(output_root, "EUR-USD", REQUESTED_DATE, "ASK")
+            bid_before = bid_path.read_bytes()
+            ask_before = ask_path.read_bytes()
+            calls: list[str] = []
+
+            result = run_combined_downloads(
+                "EUR-USD",
+                REQUESTED_DATE,
+                5,
+                output_root=output_root,
+                fetcher=lambda url: (
+                    calls.append(url),
+                    ask_bytes() if "/ASK/" in url else sample_bytes(),
+                )[1],
+                no_cache=True,
+            )
+
+            self.assertEqual(
+                calls,
+                [
+                    "https://jetta.dukascopy.com/v1/candles/minute/EUR-USD/BID/2026/9/13",
+                    "https://jetta.dukascopy.com/v1/candles/minute/EUR-USD/ASK/2026/9/13",
+                ],
+            )
+            self.assertFalse(any("/COMB/" in url for url in calls))
+            self.assertFalse(result.cache_enabled)
+            self.assertEqual(result.raw_downloaded_sides, ("BID", "ASK"))
+            self.assertEqual(result.raw_cached_sides, ())
+            self.assertEqual(result.source_message, "Downloaded BID and ASK JSON without caching")
+            self.assertEqual(bid_path.read_bytes(), bid_before)
+            self.assertEqual(ask_path.read_bytes(), ask_before)
+            self.assertEqual(result.created_aggregations, (5,))
 
     def test_csv_output_has_iso_timestamp_and_shared_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

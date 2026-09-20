@@ -99,6 +99,11 @@ def _add_download_arguments(parser: argparse.ArgumentParser) -> None:
         help="write derived candle and tick data as CSV instead of Parquet",
     )
     parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="bypass raw JSON caches and do not save downloaded JSON responses",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         metavar="PATH",
@@ -263,6 +268,7 @@ def _run_extended_date_range(
     output_root: Path,
     fetcher: Callable[[str], bytes],
     output_format: str,
+    no_cache: bool,
 ) -> tuple[_ExtendedDateOutcome, ...]:
     outcomes: list[_ExtendedDateOutcome] = []
     for requested_date in requested_dates:
@@ -281,6 +287,7 @@ def _run_extended_date_range(
                     output_root=output_root,
                     fetcher=fetcher,
                     output_format=output_format,
+                    no_cache=no_cache,
                 )
             except Exception as exc:
                 errors.append(f"candles: {_path_free_error_text(str(exc))}")
@@ -294,6 +301,7 @@ def _run_extended_date_range(
                     output_root=output_root,
                     fetcher=fetcher,
                     output_format=output_format,
+                    no_cache=no_cache,
                 )
             except Exception as exc:
                 errors.append(f"ticks: {_path_free_error_text(str(exc))}")
@@ -477,6 +485,7 @@ def main(
             output_root=resolved_output_root,
             fetcher=fetcher,
             output_format=output_format,
+            no_cache=arguments.no_cache,
         )
         return _print_extended_download_results(outcomes)
 
@@ -488,5 +497,6 @@ def main(
         output_root=resolved_output_root,
         fetcher=fetcher,
         output_format=output_format,
+        no_cache=arguments.no_cache,
     )
     return _print_download_results(outcomes)

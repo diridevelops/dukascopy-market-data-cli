@@ -102,6 +102,7 @@ class DownloadBatchResult:
     created_aggregations: tuple[int, ...]
     skipped_aggregations: tuple[int, ...]
     output_format: str = "parquet"
+    cache_enabled: bool = True
 
     @property
     def parquet_paths(self) -> tuple[Path, ...]:
@@ -117,6 +118,8 @@ class DownloadBatchResult:
 
     @property
     def source_message(self) -> str:
+        if not self.cache_enabled:
+            return "Downloaded without caching"
         return "Downloaded" if self.raw_was_downloaded else "Reused cached JSON"
 
 
@@ -132,6 +135,7 @@ class CombinedDownloadBatchResult:
     created_aggregations: tuple[int, ...]
     skipped_aggregations: tuple[int, ...]
     output_format: str = "parquet"
+    cache_enabled: bool = True
 
     @property
     def parquet_paths(self) -> tuple[Path, ...]:
@@ -153,6 +157,8 @@ class CombinedDownloadBatchResult:
     def source_message(self) -> str:
         downloaded = self.raw_downloaded_sides
         cached = self.raw_cached_sides
+        if not self.cache_enabled:
+            return f"Downloaded {' and '.join(downloaded)} JSON without caching"
         if downloaded and cached:
             return (
                 f"Downloaded {', '.join(downloaded)} JSON and reused cached "
@@ -1157,8 +1163,9 @@ def _load_or_download_raw(
     *,
     output_root: Path,
     fetcher: Callable[[str], bytes],
+    use_cache: bool = True,
 ) -> tuple[bytes, Path, bool]:
-    """Load one validated-cache candidate or download its raw response."""
+    """Load a cached response or download fresh bytes when caching is disabled."""
 
     normalized_instrument = validate_instrument(instrument)
     normalized_side = validate_side(side)
@@ -1169,8 +1176,7 @@ def _load_or_download_raw(
         requested_date,
         normalized_side,
     )
-    was_downloaded = not destination.exists()
-    if was_downloaded:
+    if not use_cache or not destination.exists():
         return (
             fetcher(build_endpoint_url(normalized_instrument, normalized_side, requested_date)),
             destination,
@@ -1188,6 +1194,7 @@ def run_downloads(
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
     output_format: str = "parquet",
+    no_cache: bool = False,
 ) -> DownloadBatchResult | CombinedDownloadBatchResult:
     """Reuse or download raw data, then publish requested aggregations."""
 
@@ -1204,6 +1211,7 @@ def run_downloads(
             output_root=normalized_root,
             fetcher=fetcher,
             output_format=normalized_format,
+            no_cache=no_cache,
         )
 
     raw_bytes, json_destination, raw_was_downloaded = _load_or_download_raw(
@@ -1212,11 +1220,12 @@ def run_downloads(
         requested_date,
         output_root=normalized_root,
         fetcher=fetcher,
+        use_cache=not no_cache,
     )
     minute_candles = decode_json_bytes(raw_bytes)
 
     if not minute_candles:
-        if raw_was_downloaded:
+        if raw_was_downloaded and not no_cache:
             _write_raw_json(raw_bytes, json_destination)
         return DownloadBatchResult(
             json_path=json_destination,
@@ -1226,6 +1235,7 @@ def run_downloads(
             created_aggregations=(),
             skipped_aggregations=(),
             output_format=normalized_format,
+            cache_enabled=not no_cache,
         )
 
     published_outputs: list[Path] = []
@@ -1270,7 +1280,7 @@ def run_downloads(
                     )
                 )
             created_aggregations.append(aggregation)
-        if raw_was_downloaded:
+        if raw_was_downloaded and not no_cache:
             _write_raw_json(raw_bytes, json_destination)
     except Exception:
         for path in published_outputs:
@@ -1284,6 +1294,7 @@ def run_downloads(
         created_aggregations=tuple(created_aggregations),
         skipped_aggregations=tuple(skipped_aggregations),
         output_format=normalized_format,
+        cache_enabled=not no_cache,
     )
 
 
@@ -1295,6 +1306,7 @@ def run_combined_downloads(
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
     output_format: str = "parquet",
+    no_cache: bool = False,
 ) -> CombinedDownloadBatchResult:
     """Reuse or download both sides, then publish combined aggregations."""
 
@@ -1311,6 +1323,7 @@ def run_combined_downloads(
             requested_date,
             output_root=normalized_root,
             fetcher=fetcher,
+            use_cache=not no_cache,
         )
 
     bid_bytes, bid_json_path, bid_was_downloaded = raw_by_side["BID"]
@@ -1338,7 +1351,7 @@ def run_combined_downloads(
 
     if not bid_candles:
         for raw_bytes, destination, was_downloaded in raw_by_side.values():
-            if was_downloaded:
+            if was_downloaded and not no_cache:
                 _write_raw_json(raw_bytes, destination)
         return CombinedDownloadBatchResult(
             json_paths=(bid_json_path, ask_json_path),
@@ -1349,6 +1362,7 @@ def run_combined_downloads(
             created_aggregations=(),
             skipped_aggregations=(),
             output_format=normalized_format,
+            cache_enabled=not no_cache,
         )
 
     published_outputs: list[Path] = []
@@ -1397,7 +1411,7 @@ def run_combined_downloads(
             created_aggregations.append(aggregation)
 
         for raw_bytes, destination, was_downloaded in raw_by_side.values():
-            if was_downloaded:
+            if was_downloaded and not no_cache:
                 _write_raw_json(raw_bytes, destination)
                 written_raw_paths.append(destination)
     except Exception:
@@ -1416,6 +1430,7 @@ def run_combined_downloads(
         created_aggregations=tuple(created_aggregations),
         skipped_aggregations=tuple(skipped_aggregations),
         output_format=normalized_format,
+        cache_enabled=not no_cache,
     )
 
 
@@ -1428,6 +1443,7 @@ def run_download(
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
     output_format: str = "parquet",
+    no_cache: bool = False,
 ) -> tuple[Path, list[Path], int]:
     """Process one aggregation while preserving the original return shape."""
 
@@ -1440,6 +1456,7 @@ def run_download(
         output_root=output_root,
         fetcher=fetcher,
         output_format=output_format,
+        no_cache=no_cache,
     )
     return result.json_path, list(result.output_paths), result.minute_count
 
@@ -1453,6 +1470,7 @@ def run_date_range(
     output_root: Path,
     fetcher: Callable[[str], bytes] = download_json_bytes,
     output_format: str = "parquet",
+    no_cache: bool = False,
 ) -> tuple[DateRunOutcome, ...]:
     """Process dates independently and retain failures for the final summary."""
 
@@ -1471,6 +1489,7 @@ def run_date_range(
                 output_root=output_root,
                 fetcher=fetcher,
                 output_format=output_format,
+                no_cache=no_cache,
             )
         except Exception as exc:
             outcomes.append(DateRunOutcome(requested_date, None, str(exc)))
