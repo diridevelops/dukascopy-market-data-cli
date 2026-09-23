@@ -12,6 +12,7 @@ from pathlib import Path
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
+import dukascopy_market_data as public_api
 from dukascopy_market_data.candles import (
     DataValidationError,
     DownloadError,
@@ -113,6 +114,36 @@ def timestamp_for_day(value: date) -> int:
 
 
 class DukascopyCandleTests(unittest.TestCase):
+    def test_package_root_exposes_typed_candle_download_api(self) -> None:
+        expected_public_names = {
+            "run_downloads",
+            "run_date_range",
+            "run_tick_hour",
+            "run_tick_date",
+            "DownloadBatchResult",
+            "CombinedDownloadBatchResult",
+            "DateRunOutcome",
+            "TickHourResult",
+            "TickHourOutcome",
+            "TickDateResult",
+        }
+        self.assertTrue(expected_public_names.issubset(set(public_api.__all__)))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = public_api.run_downloads(
+                "EUR-USD",
+                "COMB",
+                REQUESTED_DATE,
+                (1, 15),
+                output_root=Path(temporary_directory),
+                fetcher=lambda url: ask_bytes() if "/ASK/" in url else sample_bytes(),
+            )
+
+        self.assertIsInstance(result, public_api.CombinedDownloadBatchResult)
+        self.assertEqual(result.minute_count, 5)
+        self.assertEqual(result.created_aggregations, (1, 15))
+        self.assertEqual(len(result.output_paths), 2)
+
     def test_cli_validation_rejects_invalid_values(self) -> None:
         self.assertEqual(validate_instrument("eur-usd"), "eur-usd")
         self.assertEqual(validate_instrument("A.US-USD"), "A.US-USD")

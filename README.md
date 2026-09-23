@@ -33,6 +33,7 @@ The CLI provides two commands:
 │       ├── candles.py
 │       ├── cli.py
 │       ├── instruments.py
+│       ├── py.typed
 │       └── ticks.py
 ├── tests/
 └── output/
@@ -59,6 +60,43 @@ uv tool update-shell
 Then restart the shell and run `dukascopy` directly. For project-local
 execution without installing a global command, use `uv run dukascopy` or
 `uv run --active dukascopy` as described below.
+
+### Install into another uv project
+
+From the root of the consuming project, add this repository as a dependency:
+
+```bash
+uv add "dukascopy-market-data @ git+https://github.com/diridevelops/dukascopy-market-data-cli.git"
+```
+
+The dependency provides both the importable `dukascopy_market_data` package
+and the `dukascopy` command in that project's environment. For example, run
+the CLI with `uv run dukascopy --help`, or use the Python API:
+
+```python
+from datetime import date
+from pathlib import Path
+
+from dukascopy_market_data import run_downloads
+
+result = run_downloads(
+    "EUR-USD",
+    "COMB",
+    date(2026, 9, 13),
+    (1, 5, 15),
+    output_root=Path("./market-data"),
+    output_format="parquet",
+)
+print(result.output_paths)
+```
+
+The public Python API also includes `run_date_range`, `run_tick_hour`, and
+`run_tick_date`, with their typed result and outcome classes. The existing
+`output_format` and `no_cache` options are available on the corresponding
+download functions. `uv tool install` is for a standalone, isolated CLI; use
+`uv add` when the consuming project's Python code must import this package.
+Commit the consuming project's `uv.lock` to keep its resolved Git revision
+reproducible.
 
 Run commands from the root directory:
 

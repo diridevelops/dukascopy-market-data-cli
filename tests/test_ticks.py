@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
+import dukascopy_market_data as public_api
 from dukascopy_market_data.candles import DownloadError
 from dukascopy_market_data.cli import build_argument_parser, main
 from dukascopy_market_data.ticks import (
@@ -78,6 +79,21 @@ def empty_tick_bytes(requested_date: date = REQUESTED_DATE, hour: int = 1) -> by
 
 
 class DukascopyTickTests(unittest.TestCase):
+    def test_package_root_exposes_typed_tick_download_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = public_api.run_tick_date(
+                "EUR-USD",
+                REQUESTED_DATE,
+                (1,),
+                output_root=Path(temporary_directory),
+                fetcher=lambda _: tick_bytes(),
+            )
+
+        self.assertIsInstance(result, public_api.TickDateResult)
+        self.assertEqual(len(result.successful_hours), 1)
+        self.assertIsInstance(result.successful_hours[0], public_api.TickHourResult)
+        self.assertEqual(result.successful_hours[0].tick_count, 3)
+
     def test_tick_url_hour_validation_and_paths(self) -> None:
         self.assertEqual(validate_hour("01"), 1)
         self.assertEqual(resolve_hours(None), tuple(range(24)))
