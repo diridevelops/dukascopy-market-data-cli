@@ -13,6 +13,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +21,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -32,6 +34,10 @@ HTTP_TIMEOUT_SECONDS = 30.0
 MAX_DOWNLOAD_ATTEMPTS = 3
 RETRYABLE_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
 RETRY_DELAYS_SECONDS = (1.0, 2.0)
+RATE_LIMIT_RETRY_DELAYS_SECONDS = (30.0, 60.0)
+INITIAL_REQUEST_INTERVAL_SECONDS = 1.0
+MIN_REQUEST_INTERVAL_SECONDS = 0.25
+REQUEST_INTERVAL_RAMP_SECONDS = 0.05
 MILLISECONDS_PER_MINUTE = 60_000
 MILLION = Decimal("1000000")
 INT64_MAX = 2**63 - 1
@@ -40,6 +46,54 @@ INSTRUMENT_PATTERN = re.compile(
     r"^[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*-[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*$"
 )
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class _AdaptiveRequestPacer:
+    """Share a conservative, adapting request schedule across package calls."""
+
+    def __init__(self, *, clock: Callable[[], float] | None = None):
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._interval = INITIAL_REQUEST_INTERVAL_SECONDS
+        self._next_request_at = 0.0
+        self._blocked_until = 0.0
+
+    @property
+    def interval(self) -> float:
+        with self._lock:
+            return self._interval
+
+    def wait_for_slot(self, sleeper: Callable[[float], None]) -> float:
+        """Reserve the next process-wide request slot, sleeping as needed."""
+        while True:
+            with self._lock:
+                now = self._clock()
+                scheduled_at = max(self._next_request_at, self._blocked_until)
+                delay = scheduled_at - now
+                if delay <= 0:
+                    self._next_request_at = now + self._interval
+                    return now
+            sleeper(delay)
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._interval = max(
+                MIN_REQUEST_INTERVAL_SECONDS,
+                self._interval - REQUEST_INTERVAL_RAMP_SECONDS,
+            )
+
+    def back_off(self, seconds: float) -> None:
+        """Return to the safe pace and block requests for a server cooldown."""
+        with self._lock:
+            now = self._clock()
+            self._interval = INITIAL_REQUEST_INTERVAL_SECONDS
+            self._blocked_until = max(
+                self._blocked_until,
+                now + max(0.0, seconds),
+            )
+
+
+_REQUEST_PACER = _AdaptiveRequestPacer()
 
 
 class DataValidationError(ValueError):
@@ -1124,7 +1178,7 @@ def download_json_bytes(
     opener: Callable[..., Any] = urllib.request.urlopen,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> bytes:
-    """Download one response, retrying only transient failures."""
+    """Download one response with shared pacing and transient-error retries."""
 
     request = urllib.request.Request(
         url,
@@ -1133,27 +1187,98 @@ def download_json_bytes(
     )
     last_error: Exception | None = None
     for attempt in range(MAX_DOWNLOAD_ATTEMPTS):
+        _REQUEST_PACER.wait_for_slot(sleeper)
         try:
             with opener(request, timeout=timeout) as response:
                 status = getattr(response, "status", 200)
+                retry_after = _retry_after_seconds(
+                    _response_header(response, "Retry-After")
+                )
                 if status >= 400:
                     status_error = DownloadError(f"HTTP {status} from {url}")
                     last_error = status_error
-                    if status not in RETRYABLE_HTTP_CODES or attempt >= MAX_DOWNLOAD_ATTEMPTS - 1:
+                    _apply_response_backoff(status, retry_after, attempt)
+                    if (
+                        status not in RETRYABLE_HTTP_CODES
+                        or attempt >= MAX_DOWNLOAD_ATTEMPTS - 1
+                    ):
                         raise status_error
+                    if status != 429:
+                        sleeper(RETRY_DELAYS_SECONDS[attempt])
+                    continue
                 else:
-                    return response.read()
+                    raw_bytes = response.read()
+                    if retry_after is None:
+                        _REQUEST_PACER.record_success()
+                    else:
+                        _REQUEST_PACER.back_off(retry_after)
+                    return raw_bytes
         except urllib.error.HTTPError as exc:
             last_error = exc
-            if exc.code not in RETRYABLE_HTTP_CODES or attempt >= MAX_DOWNLOAD_ATTEMPTS - 1:
+            retry_after = _retry_after_seconds(
+                _response_header(exc, "Retry-After")
+            )
+            _apply_response_backoff(exc.code, retry_after, attempt)
+            if (
+                exc.code not in RETRYABLE_HTTP_CODES
+                or attempt >= MAX_DOWNLOAD_ATTEMPTS - 1
+            ):
                 raise DownloadError(f"HTTP {exc.code} while downloading {url}") from exc
+            if exc.code != 429:
+                sleeper(RETRY_DELAYS_SECONDS[attempt])
+            continue
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = exc
             if attempt >= MAX_DOWNLOAD_ATTEMPTS - 1:
                 raise DownloadError(f"could not download {url}: {exc}") from exc
-        if attempt < len(RETRY_DELAYS_SECONDS):
             sleeper(RETRY_DELAYS_SECONDS[attempt])
     raise DownloadError(f"could not download {url}: {last_error}") from last_error
+
+
+def _response_header(response: Any, name: str) -> str | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get(name)
+    return None if value is None else str(value)
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse the seconds and HTTP-date forms allowed by Retry-After."""
+    if value is None or not value.strip():
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(
+            0.0,
+            (retry_at - datetime.now(timezone.utc)).total_seconds(),
+        )
+
+
+def _apply_response_backoff(
+    status: int,
+    retry_after_seconds: float | None,
+    attempt: int,
+) -> None:
+    """Apply shared pacing for a 429 or any response carrying Retry-After."""
+    if status == 429:
+        local_delay = (
+            RATE_LIMIT_RETRY_DELAYS_SECONDS[attempt]
+            if attempt < len(RATE_LIMIT_RETRY_DELAYS_SECONDS)
+            else 0.0
+        )
+        _REQUEST_PACER.back_off(
+            max(local_delay, retry_after_seconds or 0.0)
+        )
+    elif retry_after_seconds is not None:
+        _REQUEST_PACER.back_off(retry_after_seconds)
 
 
 def _load_or_download_raw(
@@ -1183,6 +1308,96 @@ def _load_or_download_raw(
             True,
         )
     return destination.read_bytes(), destination, False
+
+
+def _load_combined_sources(
+    instrument: str,
+    requested_date: date,
+    *,
+    cache_root: Path | None,
+    fetcher: Callable[[str], bytes],
+    use_cache: bool,
+) -> tuple[
+    dict[str, tuple[bytes, Path | None, bool]],
+    list[MinuteCandle],
+    list[MinuteCandle],
+]:
+    """Fetch or reuse both sides, then validate their aligned timelines."""
+    raw_by_side: dict[str, tuple[bytes, Path | None, bool]] = {}
+    for side in ("BID", "ASK"):
+        if cache_root is None:
+            raw_by_side[side] = (
+                fetcher(build_endpoint_url(instrument, side, requested_date)),
+                None,
+                True,
+            )
+        else:
+            raw_by_side[side] = _load_or_download_raw(
+                instrument,
+                side,
+                requested_date,
+                output_root=cache_root,
+                fetcher=fetcher,
+                use_cache=use_cache,
+            )
+
+    bid_candles = decode_json_bytes(raw_by_side["BID"][0])
+    ask_candles = decode_json_bytes(raw_by_side["ASK"][0])
+    combine_candles(bid_candles, ask_candles)
+    return raw_by_side, bid_candles, ask_candles
+
+
+def _persist_combined_raw_cache(
+    raw_by_side: Mapping[str, tuple[bytes, Path | None, bool]],
+    *,
+    cache_enabled: bool,
+) -> None:
+    """Persist newly downloaded raw sides and roll back partial cache writes."""
+    if not cache_enabled:
+        return
+    written_paths: list[Path] = []
+    try:
+        for raw_bytes, destination, was_downloaded in raw_by_side.values():
+            if was_downloaded and destination is not None:
+                _write_raw_json(raw_bytes, destination)
+                written_paths.append(destination)
+    except Exception:
+        for path in written_paths:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def download_combined_candles(
+    instrument: str,
+    requested_date: date,
+    aggregation_minutes: int | str = 1,
+    *,
+    cache_root: Path | None = None,
+    fetcher: Callable[[str], bytes] = download_json_bytes,
+) -> tuple[CombinedAggregatedCandle, ...]:
+    """Return aligned BID/ASK candles without writing aggregate files.
+
+    When ``cache_root`` is supplied, raw BID and ASK responses reuse the same
+    JSON cache as :func:`run_combined_downloads`. Without it, the fetch is
+    entirely in memory.
+    """
+    normalized_instrument = validate_instrument(instrument)
+    normalized_aggregation = validate_aggregation(aggregation_minutes)
+    normalized_cache_root = Path(cache_root) if cache_root is not None else None
+    raw_by_side, bid_candles, ask_candles = _load_combined_sources(
+        normalized_instrument,
+        requested_date,
+        cache_root=normalized_cache_root,
+        fetcher=fetcher,
+        use_cache=True,
+    )
+    combined = aggregate_combined_candles(
+        bid_candles,
+        ask_candles,
+        normalized_aggregation,
+    )
+    _persist_combined_raw_cache(raw_by_side, cache_enabled=cache_root is not None)
+    return tuple(combined)
 
 
 def run_downloads(
@@ -1315,44 +1530,31 @@ def run_combined_downloads(
     normalized_format = validate_output_format(output_format)
     normalized_root = Path(output_root)
 
-    raw_by_side: dict[str, tuple[bytes, Path, bool]] = {}
-    for side in ("BID", "ASK"):
-        raw_by_side[side] = _load_or_download_raw(
-            normalized_instrument,
-            side,
-            requested_date,
-            output_root=normalized_root,
-            fetcher=fetcher,
-            use_cache=not no_cache,
-        )
-
-    bid_bytes, bid_json_path, bid_was_downloaded = raw_by_side["BID"]
-    ask_bytes, ask_json_path, ask_was_downloaded = raw_by_side["ASK"]
-    bid_candles = decode_json_bytes(bid_bytes)
-    ask_candles = decode_json_bytes(ask_bytes)
-    combine_candles(bid_candles, ask_candles)
+    raw_by_side, bid_candles, ask_candles = _load_combined_sources(
+        normalized_instrument,
+        requested_date,
+        cache_root=normalized_root,
+        fetcher=fetcher,
+        use_cache=not no_cache,
+    )
+    bid_json_path = raw_by_side["BID"][1]
+    ask_json_path = raw_by_side["ASK"][1]
+    assert bid_json_path is not None and ask_json_path is not None
 
     raw_downloaded_sides = tuple(
-        side
-        for side, was_downloaded in (
-            ("BID", bid_was_downloaded),
-            ("ASK", ask_was_downloaded),
-        )
+        side for side, (_, _, was_downloaded) in raw_by_side.items()
         if was_downloaded
     )
     raw_cached_sides = tuple(
-        side
-        for side, was_downloaded in (
-            ("BID", bid_was_downloaded),
-            ("ASK", ask_was_downloaded),
-        )
+        side for side, (_, _, was_downloaded) in raw_by_side.items()
         if not was_downloaded
     )
 
     if not bid_candles:
-        for raw_bytes, destination, was_downloaded in raw_by_side.values():
-            if was_downloaded and not no_cache:
-                _write_raw_json(raw_bytes, destination)
+        _persist_combined_raw_cache(
+            raw_by_side,
+            cache_enabled=not no_cache,
+        )
         return CombinedDownloadBatchResult(
             json_paths=(bid_json_path, ask_json_path),
             output_paths=(),
@@ -1368,7 +1570,6 @@ def run_combined_downloads(
     published_outputs: list[Path] = []
     created_aggregations: list[int] = []
     skipped_aggregations: list[int] = []
-    written_raw_paths: list[Path] = []
     try:
         for aggregation in normalized_aggregations:
             aggregated_candles = aggregate_combined_candles(
@@ -1410,14 +1611,12 @@ def run_combined_downloads(
                 )
             created_aggregations.append(aggregation)
 
-        for raw_bytes, destination, was_downloaded in raw_by_side.values():
-            if was_downloaded and not no_cache:
-                _write_raw_json(raw_bytes, destination)
-                written_raw_paths.append(destination)
+        _persist_combined_raw_cache(
+            raw_by_side,
+            cache_enabled=not no_cache,
+        )
     except Exception:
         for path in published_outputs:
-            path.unlink(missing_ok=True)
-        for path in written_raw_paths:
             path.unlink(missing_ok=True)
         raise
 

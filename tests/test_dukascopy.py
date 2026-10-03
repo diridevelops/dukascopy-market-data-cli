@@ -3,16 +3,22 @@ import json
 import io
 import os
 import tempfile
+import threading
+import urllib.error
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from email.message import Message
+from email.utils import format_datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 import dukascopy_market_data as public_api
+import dukascopy_market_data.candles as candle_module
 from dukascopy_market_data.candles import (
     DataValidationError,
     DownloadError,
@@ -122,6 +128,8 @@ class DukascopyCandleTests(unittest.TestCase):
             "run_tick_date",
             "DownloadBatchResult",
             "CombinedDownloadBatchResult",
+            "CombinedAggregatedCandle",
+            "download_combined_candles",
             "DateRunOutcome",
             "TickHourResult",
             "TickHourOutcome",
@@ -143,6 +151,82 @@ class DukascopyCandleTests(unittest.TestCase):
         self.assertEqual(result.minute_count, 5)
         self.assertEqual(result.created_aggregations, (1, 15))
         self.assertEqual(len(result.output_paths), 2)
+
+    def test_combined_candles_can_be_returned_without_aggregate_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_root = Path(temporary_directory)
+            calls: list[str] = []
+
+            def fetch(url: str) -> bytes:
+                calls.append(url)
+                return ask_bytes() if "/ASK/" in url else sample_bytes()
+
+            candles = public_api.download_combined_candles(
+                "EUR-USD",
+                REQUESTED_DATE,
+                1,
+                cache_root=cache_root,
+                fetcher=fetch,
+            )
+
+            self.assertEqual(len(candles), 5)
+            self.assertIsInstance(candles[0], public_api.CombinedAggregatedCandle)
+            self.assertEqual(candles[0].timestamp_ms, BASE_TIMESTAMP)
+            self.assertEqual(candles[0].bid_open, Decimal("1.0"))
+            self.assertEqual(candles[0].ask_open, Decimal("1.1"))
+            self.assertEqual(candles[0].bid_volume, 1_500_000)
+            self.assertEqual(candles[0].ask_volume, 2_000_000)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(list(cache_root.rglob("*.json"))), 2)
+            self.assertEqual(list(cache_root.rglob("*.parquet")), [])
+            self.assertEqual(list(cache_root.rglob("*.csv")), [])
+
+            def fail_on_cached_download(_: str) -> bytes:
+                self.fail("in-memory combined loader should reuse its raw JSON cache")
+
+            aggregated = public_api.download_combined_candles(
+                "EUR-USD",
+                REQUESTED_DATE,
+                15,
+                cache_root=cache_root,
+                fetcher=fail_on_cached_download,
+            )
+            self.assertEqual(len(aggregated), 2)
+            self.assertEqual(aggregated[0].bid_open, candles[0].bid_open)
+            self.assertEqual(aggregated[0].ask_open, candles[0].ask_open)
+
+    def test_in_memory_loader_caches_empty_days(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_root = Path(temporary_directory)
+            calls: list[str] = []
+
+            def fetch(url: str) -> bytes:
+                calls.append(url)
+                return empty_bytes(timestamp_for_day(REQUESTED_DATE))
+
+            candles = public_api.download_combined_candles(
+                "EUR-USD",
+                REQUESTED_DATE,
+                cache_root=cache_root,
+                fetcher=fetch,
+            )
+            self.assertEqual(candles, ())
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(list(cache_root.rglob("*.json"))), 2)
+
+            def fail_on_cached_download(_: str) -> bytes:
+                self.fail("empty day should be reused from its raw JSON cache")
+
+            self.assertEqual(
+                public_api.download_combined_candles(
+                    "EUR-USD",
+                    REQUESTED_DATE,
+                    cache_root=cache_root,
+                    fetcher=fail_on_cached_download,
+                ),
+                (),
+            )
+            self.assertEqual(len(calls), 2)
 
     def test_cli_validation_rejects_invalid_values(self) -> None:
         self.assertEqual(validate_instrument("eur-usd"), "eur-usd")
@@ -1373,6 +1457,192 @@ class DukascopyCandleTests(unittest.TestCase):
                 )
             self.assertEqual(failed, 1)
             self.assertIn("output location cannot be written", stderr.getvalue())
+
+
+class _ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        self.lock = threading.Lock()
+
+    def monotonic(self) -> float:
+        with self.lock:
+            return self.now
+
+    def sleep(self, seconds: float) -> None:
+        with self.lock:
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+
+class _FakeResponse:
+    def __init__(self, *, status: int = 200, headers=None, body: bytes = b"ok"):
+        self.status = status
+        self.headers = headers or Message()
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self) -> bytes:
+        return self.body
+
+
+class AdaptiveRequestPacerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = _ManualClock()
+        self.pacer = candle_module._AdaptiveRequestPacer(
+            clock=self.clock.monotonic
+        )
+        self.pacer_patch = patch.object(
+            candle_module, "_REQUEST_PACER", self.pacer
+        )
+        self.pacer_patch.start()
+        self.addCleanup(self.pacer_patch.stop)
+
+    def test_successes_ramp_down_to_the_minimum_interval(self) -> None:
+        first = self.pacer.wait_for_slot(self.clock.sleep)
+        self.pacer.record_success()
+        second = self.pacer.wait_for_slot(self.clock.sleep)
+        self.pacer.record_success()
+        third = self.pacer.wait_for_slot(self.clock.sleep)
+
+        self.assertEqual((first, second, third), (0.0, 1.0, 1.95))
+        for _ in range(20):
+            self.pacer.record_success()
+        self.assertEqual(self.pacer.interval, 0.25)
+
+    def test_throttled_responses_restore_safe_pace_and_retry_after_is_global(self) -> None:
+        self.pacer.record_success()
+        self.assertEqual(self.pacer.interval, 0.95)
+
+        self.pacer.back_off(10.0)
+        self.assertEqual(self.pacer.interval, 1.0)
+        next_slot = self.pacer.wait_for_slot(self.clock.sleep)
+        self.assertEqual(next_slot, 10.0)
+        self.assertEqual(self.clock.sleeps, [10.0])
+
+    def test_concurrent_callers_reserve_distinct_slots(self) -> None:
+        barrier = threading.Barrier(5)
+        starts: list[float] = []
+        starts_lock = threading.Lock()
+
+        def reserve_slot() -> None:
+            barrier.wait(timeout=2)
+            start = self.pacer.wait_for_slot(self.clock.sleep)
+            with starts_lock:
+                starts.append(start)
+
+        threads = [threading.Thread(target=reserve_slot) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        ordered = sorted(starts)
+        self.assertEqual(len(ordered), 5)
+        self.assertTrue(
+            all(
+                current - previous >= 1.0
+                for previous, current in zip(ordered, ordered[1:])
+            )
+        )
+
+    def test_429_uses_three_total_attempts_and_30_then_60_second_waits(self) -> None:
+        starts: list[float] = []
+
+        def always_rate_limited(_request, *, timeout):
+            starts.append(self.clock.monotonic())
+            raise _make_http_error(429)
+
+        with self.assertRaises(DownloadError):
+            candle_module.download_json_bytes(
+                "https://example.test/candles",
+                opener=always_rate_limited,
+                sleeper=self.clock.sleep,
+            )
+
+        self.assertEqual(starts, [0.0, 30.0, 90.0])
+        self.assertEqual(self.clock.sleeps, [30.0, 60.0])
+
+    def test_retry_after_seconds_extend_rate_limit_cooldown(self) -> None:
+        starts: list[float] = []
+
+        def rate_limit_once(_request, *, timeout):
+            starts.append(self.clock.monotonic())
+            if len(starts) == 1:
+                raise _make_http_error(429, retry_after="45")
+            return _FakeResponse()
+
+        result = candle_module.download_json_bytes(
+            "https://example.test/candles",
+            opener=rate_limit_once,
+            sleeper=self.clock.sleep,
+        )
+
+        self.assertEqual(result, b"ok")
+        self.assertEqual(starts, [0.0, 45.0])
+        self.assertEqual(self.clock.sleeps, [45.0])
+
+    def test_retry_after_http_date_is_honored(self) -> None:
+        retry_at = datetime.now(timezone.utc) + timedelta(seconds=10)
+        starts: list[float] = []
+
+        def unavailable_once(_request, *, timeout):
+            starts.append(self.clock.monotonic())
+            if len(starts) == 1:
+                raise _make_http_error(
+                    503,
+                    retry_after=format_datetime(retry_at, usegmt=True),
+                )
+            return _FakeResponse()
+
+        result = candle_module.download_json_bytes(
+            "https://example.test/candles",
+            opener=unavailable_once,
+            sleeper=self.clock.sleep,
+        )
+
+        self.assertEqual(result, b"ok")
+        self.assertEqual(len(starts), 2)
+        self.assertGreaterEqual(starts[1], 9.0)
+        self.assertLessEqual(starts[1], 10.0)
+
+    def test_non_rate_limit_transient_errors_keep_existing_delays(self) -> None:
+        starts: list[float] = []
+
+        def unavailable_twice(_request, *, timeout):
+            starts.append(self.clock.monotonic())
+            if len(starts) < 3:
+                raise _make_http_error(503)
+            return _FakeResponse()
+
+        result = candle_module.download_json_bytes(
+            "https://example.test/candles",
+            opener=unavailable_twice,
+            sleeper=self.clock.sleep,
+        )
+
+        self.assertEqual(result, b"ok")
+        self.assertEqual(starts, [0.0, 1.0, 3.0])
+        self.assertEqual(self.clock.sleeps, [1.0, 2.0])
+
+
+def _make_http_error(status: int, *, retry_after: str | None = None):
+    headers = Message()
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return urllib.error.HTTPError(
+        "https://example.test/candles",
+        status,
+        "test response",
+        headers,
+        None,
+    )
 
 
 if __name__ == "__main__":
